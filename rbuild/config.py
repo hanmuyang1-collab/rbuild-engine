@@ -15,6 +15,7 @@ The config is organized in five sections:
   ParallelConfig   — the parallel stages whose branches bundle outputs and
                      push them to the next parallel stage
   MemoryConfig     — the gradient-free fast-weight delta-rule memory
+  VisionConfig     — ViT tower for image/video soft tokens (blind by default)
   TrainConfig      — Muon / WSD / precision / batching / cost model
 
 Validation and derived counters (parameters, active parameters, estimated
@@ -115,6 +116,33 @@ class MemoryConfig:
 
 
 @dataclass
+class VisionConfig:
+    """
+    VL support (v2.1). Default is *blind*: enabled=False means the vision
+    tower is never built and the model is bit-identical to the text-only
+    v2.0 path. Set enabled=True and image_token_id to go multimodal.
+
+    Images (or sampled video frames) are encoded by a ViT tower, projected
+    to d_model, and spliced into the token stream at `image_token_id`
+    placeholder positions — downstream stages just see more tokens.
+    """
+    enabled: bool = False            # False = blind (text-only), zero overhead
+    image_token_id: Optional[int] = None  # reserved placeholder id in the vocab
+    image_size: int = 224
+    patch_size: int = 14
+    channels: int = 3
+    vit_layers: int = 6
+    vit_dim: Optional[int] = None    # None -> d_model
+    vit_heads: int = 12
+    vit_ffn_mult: float = 4.0
+    use_cls_token: bool = False
+    freeze_vision: bool = False      # train projector only (cheap VL bootstrap)
+    # video (s4-style whole-video understanding)
+    video: bool = True               # allow (B, frames, C, H, W) inputs
+    max_video_frames: int = 16       # learned frame-position table size
+
+
+@dataclass
 class TrainConfig:
     """Training speed stack + cost model. All user-modifiable."""
     # optimization
@@ -153,6 +181,7 @@ class RBuildConfig:
     cache_loop: CacheLoopConfig = field(default_factory=CacheLoopConfig)
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    vision: VisionConfig = field(default_factory=VisionConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
 
     # ------------------------------------------------------------------ #
@@ -173,6 +202,13 @@ class RBuildConfig:
         assert mem.key_dim >= 8 and mem.value_dim >= 8
         assert self.train.precision in ("fp32", "bf16", "fp8")
         assert self.train.optimizer in ("muon", "adamw")
+        v = self.vision
+        if v.enabled:
+            assert v.image_token_id is not None, \
+                "vision.enabled=True requires an image_token_id placeholder"
+            assert v.image_size % v.patch_size == 0, "image_size must divide patch_size"
+            vd = v.vit_dim or m.d_model
+            assert vd % v.vit_heads == 0, "vit_dim must divide vit_heads"
 
     # ------------------------------------------------------------------ #
     # parameter counter (naive vs optimized stack)
@@ -237,15 +273,34 @@ class RBuildConfig:
         fact_proj = d * mem.key_dim + d * mem.value_dim
         final_norm = d
 
-        total = cache_line + parallel_total + embed + head + fact_proj + final_norm
+        # vision tower (mirrors rbuild.vision.VisionTower exactly)
+        vision_params = 0
+        if self.vision.enabled:
+            v = self.vision
+            vd = v.vit_dim or d
+            g = v.image_size // v.patch_size
+            tpi = g * g + (1 if v.use_cls_token else 0)
+            vit_block = 4 * vd * vd + 2 * vd + 3 * vd * int(vd * v.vit_ffn_mult)
+            vision_params = (
+                v.channels * vd * v.patch_size * v.patch_size   # patch conv
+                + tpi * vd                                       # pos embed
+                + (vd if v.use_cls_token else 0)                 # cls token
+                + v.vit_layers * vit_block
+                + vd                                             # out norm
+                + vd * d                                         # projector
+                + (v.max_video_frames * d if v.video else 0)     # frame embed
+            )
+
+        total = cache_line + parallel_total + embed + head + fact_proj + final_norm + vision_params
         active = cache_line_active * cl.mod_capacity + parallel_active * p.mod_capacity \
-            + embed + head + fact_proj + final_norm
+            + embed + head + fact_proj + final_norm + vision_params
         return {
             "total_params": int(total),
             "active_params_per_token": int(active),
             "cache_loop_params": int(cache_line),
             "parallel_params": int(parallel_total),
             "embed_params": int(embed + head),
+            "vision_params": int(vision_params),
             "memory_matrix": int(mem.key_dim * mem.value_dim if mem.enabled else 0),
         }
 
@@ -295,6 +350,9 @@ class RBuildConfig:
             f" {self.parallel.n_shared_experts} shared",
             f"  fast-weight memory: {'on' if self.memory.enabled else 'off'}"
             f" (key={self.memory.key_dim}, value={self.memory.value_dim})",
+            f"  vision            : {'blind (off)' if not self.vision.enabled else 'on'}"
+            + (f" ({c['vision_params']/1e6:.2f}M tower, {self.vision.vit_layers} ViT layers"
+               f", video={'on' if self.vision.video else 'off'})" if self.vision.enabled else ""),
             "-" * 56,
             f"  total params      : {fmt(c['total_params'])}",
             f"  active per token  : {fmt(c['active_params_per_token'])}",
