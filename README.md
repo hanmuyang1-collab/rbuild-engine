@@ -1,4 +1,4 @@
-# R-Build v2.0
+# R-Build v2.1
 
 **A fully user-modifiable, open-source LLM architecture + training-speed engine.**
 Every knob is yours: programmatically, through an interactive widget panel in
@@ -32,6 +32,27 @@ Carried over from the R-Build optimized stack: **MoD routing** (top-p tokens per
 block), **fine-grained MoE + dense-sized shared expert**, **Muon** optimizer,
 **WSD** schedule, **chunked cross-entropy**, and the **fast-weight delta-rule
 memory** (facts written without any training step).
+
+## Vision-language (v2.1)
+
+Complete VL support via a ViT tower (`VisionTower`): images — or sampled video
+frames — are encoded, projected to `d_model`, and spliced into the token stream
+at `vision.image_token_id` placeholder positions. The cache loop and parallel
+stages just see more tokens; loss is automatically masked at vision positions;
+video gets learned per-frame position embeddings (whole-video understanding).
+
+```python
+cfg = preset("s1")
+cfg.vision.enabled = True
+cfg.vision.image_token_id = 128001     # a reserved id in your tokenizer vocab
+model = RBuildModel(cfg)               # tower built, counter includes it exactly
+logits, loss = model(ids, targets=ids, images=imgs)   # imgs: (B, n_img_or_frames, C, H, W)
+```
+
+Default is **blind**: `vision.enabled=False` builds no tower at all and is
+bit-identical to the text-only path. `vision.freeze_vision=True` trains only
+the projector for a cheap VL bootstrap. All `vision.*` values are in the
+interactive panel like everything else.
 
 ## Install
 
@@ -96,5 +117,13 @@ model2 = Trainer.load_checkpoint("ckpt/")
 
 All presets are counter-verified against the v2 architecture; treat them as
 starting points and retune in the panel.
+
+## Training scripts
+
+- `examples/train_rhododendron_lite.py` — full training run for
+  **rhododendron-lite (20B-A3.5B, blind)**: HF streaming data (no full
+  download), Muon + WSD, bf16/fp8 flags, gradient checkpointing,
+  periodic checkpoints, resume, FSDP/DDP via torchrun, optional push to the
+  GeoThinkAI org. `--smoke` runs a tiny local sanity pass with no downloads.
 
 Apache-2.0. Part of the GeoThinkAI R-Build project.

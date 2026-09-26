@@ -33,7 +33,7 @@ from .config import RBuildConfig, preset
 
 def _fields(cfg: RBuildConfig):
     """Yield (section_name, section_obj, field) for every config value."""
-    for sec_name in ("model", "cache_loop", "parallel", "memory", "train"):
+    for sec_name in ("model", "cache_loop", "parallel", "memory", "vision", "train"):
         sec = getattr(cfg, sec_name)
         for f in dataclasses.fields(sec):
             yield sec_name, sec, f
