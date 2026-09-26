@@ -15,6 +15,9 @@ tokens and bundle to push to the next set of parallel layers"):
     are bundled — learned gate, mean, or concat+project — and the bundle is
     pushed to the next parallel stage. During token generation the final
     bundle is what produces logits.
+
+v2.1: vision soft tokens splice into the stream before the cache loop
+(`images=` argument), with loss automatically masked at vision positions.
 """
 
 from __future__ import annotations
@@ -24,11 +27,13 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from .config import RBuildConfig
 from .layers.attention import CausalAttention, MoDRouter, RMSNorm
 from .layers.moe import build_ffn
 from .memory import FastWeightMemory
+from .vision import VisionTower
 
 
 # --------------------------------------------------------------------------- #
@@ -187,6 +192,14 @@ class RBuildModel(nn.Module):
         self.fact_value_proj = nn.Linear(m.d_model, cfg.memory.value_dim, bias=False)
 
         self.drop = nn.Dropout(m.dropout)
+
+        # vision tower (v2.1) — not built at all in blind mode
+        self.vision = VisionTower(cfg) if cfg.vision.enabled else None
+        if self.vision is not None and cfg.vision.freeze_vision:
+            for name, p_ in self.vision.named_parameters():
+                if "projector" not in name:
+                    p_.requires_grad = False
+
         self.apply(self._init)
 
     @staticmethod
@@ -197,9 +210,48 @@ class RBuildModel(nn.Module):
             nn.init.normal_(module.weight, std=0.02)
 
     # ------------------------------------------------------------------ #
+    def _splice_vision(self, input_ids: torch.Tensor,
+                       images: Optional[torch.Tensor]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Replace `<image>` placeholder embeddings with vision-tower soft tokens.
+        Returns (inputs_embeds, image_mask) — mask marks vision positions so
+        the loss can skip them.
+        """
+        emb = self.embed(input_ids)
+        if self.vision is None:
+            return emb, None
+        if images is None:
+            mask = input_ids == self.cfg.vision.image_token_id
+            if mask.any():
+                raise ValueError("input contains image placeholders but no images were passed")
+            return emb, None
+        img_tokens = self.vision(images)                       # (B, K, D)
+        B, K, D = img_tokens.shape
+        mask = input_ids == self.cfg.vision.image_token_id     # (B, T)
+        counts = mask.sum(1)
+        if not (counts == K).all():
+            raise ValueError(
+                f"each sample needs exactly {K} image placeholders "
+                f"(got {counts.tolist()}); one placeholder per vision soft token")
+        emb = emb.clone()
+        emb[mask] = img_tokens.reshape(-1, D).to(emb.dtype)
+        return emb, mask
+
+    # ------------------------------------------------------------------ #
+    def _run_block(self, blk, x):
+        """Run a block, with optional activation checkpointing in training."""
+        if self.training and self.cfg.train.grad_checkpoint and torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(
+                lambda t: blk(t)[0], x, use_reentrant=False)
+        return blk(x)[0]
+
+    # ------------------------------------------------------------------ #
     def forward(self, input_ids: torch.Tensor,
-                targets: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        x = self.drop(self.embed(input_ids))
+                targets: Optional[torch.Tensor] = None,
+                images: Optional[torch.Tensor] = None,
+                ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        x, image_mask = self._splice_vision(input_ids, images)
+        x = self.drop(x)
         if self.memory is not None:
             x = self.cache_loop(x, self.memory)
         else:
@@ -208,14 +260,19 @@ class RBuildModel(nn.Module):
                 blocks = self.cache_loop.line if self.cache_loop.line is not None \
                     else self.cache_loop.loop_line[loop]
                 for blk in blocks:
-                    x, _ = blk(x)
+                    x = self._run_block(blk, x)
         for stage in self.stages:
-            x = stage(x)
+            if self.training and self.cfg.train.grad_checkpoint and torch.is_grad_enabled():
+                x = torch.utils.checkpoint.checkpoint(stage, x, use_reentrant=False)
+            else:
+                x = stage(x)
         x = self.final_norm(x)
         logits = self.lm_head(x)
 
         loss = None
         if targets is not None:
+            if image_mask is not None:
+                targets = targets.masked_fill(image_mask, -100)   # never predict vision positions
             loss = self._chunked_ce(logits, targets)
             loss = loss + 0.01 * self._moe_aux_loss()
         return logits, loss
@@ -233,7 +290,7 @@ class RBuildModel(nn.Module):
         for i in range(0, flat_l.shape[0], chunk):
             ls = F.cross_entropy(flat_l[i:i + chunk].float(), flat_t[i:i + chunk], reduction="sum")
             total = total + ls
-            count += flat_t[i:i + chunk].numel()
+            count += int((flat_t[i:i + chunk] != -100).sum())   # skip ignored (vision) positions
         return total / max(1, count)
 
     def _moe_aux_loss(self):
@@ -266,12 +323,13 @@ class RBuildModel(nn.Module):
     @torch.no_grad()
     def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 64,
                  temperature: float = 1.0, top_p: float = 0.9,
-                 top_k: int = 0, eos_id: Optional[int] = None) -> torch.Tensor:
+                 top_k: int = 0, eos_id: Optional[int] = None,
+                 images: Optional[torch.Tensor] = None) -> torch.Tensor:
         self.eval()
         out = input_ids
         for _ in range(max_new_tokens):
             window = out[:, -self.cfg.model.max_seq_len:]
-            logits, _ = self(window)
+            logits, _ = self(window, images=images)
             nxt_logits = logits[:, -1, :].float() / max(1e-6, temperature)
             if top_k > 0:
                 v, _ = torch.topk(nxt_logits, min(top_k, nxt_logits.shape[-1]))
