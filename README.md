@@ -57,8 +57,10 @@ interactive panel like everything else.
 ## Install
 
 ```bash
-pip install .                       # from this folder
+pip install git+https://github.com/hanmuyang1-collab/rbuild-engine   # straight from GitHub
+pip install .                       # or from a local clone
 pip install .[notebook]             # + ipywidgets for the interactive panel
+pip install .[train]                # + transformers/datasets for the training script
 ```
 
 ## Use it — everything is modifiable
