@@ -160,7 +160,26 @@ Tools are snails; v3 makes the model click **by generating a token**.
   frames, frames are just tokens, and the same forward that sees the
   screen also clicks it.
 
-## 7. Counter verification (project invariant)
+## 7. Generation watermarking
+
+Anything the model writes can be provably traced back to it — without
+changing a single weight. During sampling, the previous token is hashed
+with a secret `key` to seed an RNG that splits the vocabulary into a green
+list (fraction `gamma`, default 0.25); green-list logits get `+delta`
+(default 2.0). Detection replays the split and runs a one-proportion
+z-test on the green fraction:
+
+- watermarked text: green fraction ≈ 0.75, z ≈ 9 (p < 1e-19)
+- unwatermarked text: green fraction ≈ gamma, z ≈ 0
+- wrong key: statistically indistinguishable from unwatermarked
+
+Pure sampling-time signal — zero parameters, checkpoints untouched,
+`generate(..., watermark=False)` overrides per call. Tunables live in
+`WatermarkConfig` (`key`, `delta`, `gamma`, `z_threshold`); higher `delta`
+watermarks harder at a small quality cost, lower `gamma` makes detection
+need more tokens.
+
+## 8. Counter verification (project invariant)
 
 `cfg.count_parameters()` mirrors the v3 module tree **exactly** — every
 critic panel, note-taker, action head, encoderless/ViT/VaWU vision path,
@@ -175,7 +194,7 @@ holds for every configuration, and `report()` always shows
 naive-vs-optimized cost side by side. v3 overhead at s1: +101M critics,
 +19M noting (≈0.6% of 20B total).
 
-## 8. Backward compatibility
+## 9. Backward compatibility
 
 - `critic.enabled=False`, `noting.enabled=False`, `actuation.enabled=False`,
   `vision.enabled=False` → exact v2 architecture and parameter count.

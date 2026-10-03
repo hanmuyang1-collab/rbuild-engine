@@ -53,6 +53,10 @@ tokens ─► embed ─► EXTRACTION LOOP ─► PARALLEL STAGE 1 ─► ... �
    the output space — click(x, y) on a screen grid, scroll, type, wait —
    produced by a dedicated action head. Generating a token *is* the action;
    no external tool loop.
+7. **Generation watermarking.** `watermark.enabled=True` biases sampling with
+   a secret-keyed green list, so anything your model writes is provably
+   yours — `WatermarkDetector` runs a z-test with the same key. Pure
+   sampling-time signal: zero parameters, checkpoints unaffected.
 
 Everything v3 can be switched off independently; with `critic`, `noting`,
 `actuation` and `vision` all disabled the architecture is bit-identical to
@@ -66,19 +70,6 @@ pip install .                       # or from a local clone
 pip install .[notebook]             # + ipywidgets for the interactive panel
 pip install .[train]                # + transformers/datasets for the training script
 ```
-
-## The interactive trainer (start here)
-
-```bash
-python examples/train_interactive.py
-```
-
-A ten-step guided tutorial: preset ladder → critics (X/Y, loop cap) →
-self-training → thinking mode → vision → actuation → training knobs →
-data (toy / local text / HF streaming) → review → train → save + optional
-HF push. Every question has a recommended default (Enter accepts), every
-answer is validated. No prompts wanted? Edit the `ANSWERS` dict at the top
-of the script — or set `AUTO = True` to run hands-free.
 
 ## Use it — everything is modifiable
 
@@ -129,6 +120,20 @@ for action in model.action_codec.decode_actions(out[0]):
     ...                             # Action(click, x=0.31, y=0.81), Action(scroll, dy=-2), ...
 ```
 
+### Generation watermarking
+
+```python
+cfg.watermark.enabled = True
+cfg.watermark.key = "my-secret"     # keep it private
+model = RBuildModel(cfg)
+out = model.generate(ids)           # quietly watermarked
+
+from rbuild import WatermarkDetector
+det = WatermarkDetector(cfg.watermark, cfg.effective_vocab_size())
+det.detect(out)                     # {'z_score': 9.1, 'watermarked': True, ...}
+# wrong key -> not detected; unwatermarked text -> z ≈ 0
+```
+
 ### Vision: ViT, encoderless, VaWU
 
 ```python
@@ -168,12 +173,13 @@ treat them as starting points and retune in the panel.
 
 ## Training scripts
 
-- `examples/train_interactive.py` — **the tutorial trainer**: ten guided,
-  numbered steps with validated inputs and recommended defaults; editable
-  `ANSWERS` dict + `AUTO` mode for hands-free runs.
 - `examples/v3_quickstart.py` — every v3 feature in one tiny CPU run:
   counter verification, ACT halting, thinking modes, self-training,
   encoderless VL + VaWU, native actuation.
+- `examples/train_interactive.py` — the completely interactive trainer:
+  ten numbered steps from preset to checkpoint, every input validated,
+  every default recommended. Anyone can run it:
+  `python examples/train_interactive.py`
 - `examples/train_rhododendron_lite.py` — full training run for
   **rhododendron-lite (20B-A3.5B, blind)**: HF streaming data, Muon + WSD,
   bf16/fp8 flags, gradient checkpointing, periodic checkpoints, resume,
