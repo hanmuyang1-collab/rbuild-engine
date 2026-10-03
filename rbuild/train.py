@@ -1,6 +1,12 @@
 """
 R-Build trainer: Muon + WSD + precision stack + chunked CE, with the
 fast-weight memory riding along inside every checkpoint.
+
+v3 adds `self_train_step()`: the consolidation half of non-separate
+self-training. Notes that critics verified during normal running wait in a
+low-RAM CPU buffer; this step replays them and aligns the model's native
+fact-writing projections with what the critics approved — the slow weights
+absorb what the fast weights already learned.
 """
 
 from __future__ import annotations
@@ -11,6 +17,7 @@ import time
 from typing import Callable, Iterable, Optional
 
 import torch
+import torch.nn.functional as F
 
 from .config import RBuildConfig
 from .model import RBuildModel
@@ -48,6 +55,11 @@ def _autocast_ctx(precision: str, device_type: str):
     return torch.autocast(device_type=device_type, dtype=torch.bfloat16)
 
 
+def _unwrap(model):
+    raw = getattr(model, "module", model)
+    return getattr(raw, "_fsdp_wrapped_module", raw)
+
+
 class Trainer:
     def __init__(self, model: RBuildModel, cfg: RBuildConfig,
                  device: Optional[str] = None, log_fn: Optional[Callable[[str], None]] = print,
@@ -78,6 +90,8 @@ class Trainer:
         batches: iterable yielding (input_ids, targets) LongTensors of shape
         (B, T). Re-loops the iterable if it is shorter than max_steps.
         save_every > 0 writes a checkpoint to save_dir every N steps.
+        If train.self_train_every > 0, verified self-observed notes are
+        consolidated into the slow weights every N steps.
         """
         cfg = self.cfg
         max_steps = max_steps or cfg.train.max_steps
@@ -109,11 +123,63 @@ class Trainer:
                 if step % 10 == 0 or step == 1:
                     tok_s = (cfg.train.batch_size * cfg.train.grad_accum
                              * cfg.model.max_seq_len * step) / max(1e-9, time.time() - t0)
+                    halt = getattr(_unwrap(self.model).cache_loop, "last_halting", None)
+                    extra = f"  loops {halt['mean_loops']:.1f}" if halt else ""
                     self.log(f"step {step}/{max_steps}  loss {history[-1]:.4f}  "
-                             f"lr_x{lr_f:.3f}  ~{tok_s:,.0f} tok/s")
+                             f"lr_x{lr_f:.3f}  ~{tok_s:,.0f} tok/s{extra}")
+                if cfg.train.self_train_every > 0 and step % cfg.train.self_train_every == 0:
+                    st_loss = self.self_train_step()
+                    if st_loss is not None:
+                        self.log(f"  self-train consolidation loss {st_loss:.4f}")
                 if save_every > 0 and save_dir and step % save_every == 0:
                     self.save_checkpoint(save_dir)
         return {"loss": history}
+
+    # ------------------------------------------------------------------ #
+    # v3: consolidate critic-verified notes into the slow weights
+    # ------------------------------------------------------------------ #
+    def self_train_step(self) -> Optional[float]:
+        """
+        One consolidation step over the verified-note buffer: replay the
+        hidden states the notes were taken from and train the model's
+        native fact projections (the same path `remember()` uses) to
+        reproduce the critic-verified (key, value) pairs. Uses
+        train.self_train_lr, independent of the WSD schedule.
+        Returns the loss, or None if the buffer is empty.
+        """
+        model = _unwrap(self.model)
+        learner = getattr(model, "self_learner", None)
+        if learner is None:
+            return None
+        batch = learner.buffer.sample(self.cfg.noting.self_train_batch)
+        if batch is None:
+            return None
+        h, k, v, s = (t.to(self.device) for t in batch)
+
+        was_training = model.training
+        model.train()
+        for opt in self.optimizers:
+            opt.zero_grad(set_to_none=True)
+        k_hat = model.fact_key_proj(h)
+        v_hat = model.fact_value_proj(h)
+        w = (s / s.sum().clamp_min(1e-9)).unsqueeze(-1)     # score-weighted
+        loss = ((k_hat - k).pow(2) * w).sum() + ((v_hat - v).pow(2) * w).sum()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), self.cfg.train.grad_clip)
+        # consolidation uses its own lr, then the schedule's lrs are restored
+        saved = [[g["lr"] for g in opt.param_groups] for opt in self.optimizers]
+        for opt in self.optimizers:
+            for g in opt.param_groups:
+                g["lr"] = self.cfg.train.self_train_lr
+        for opt in self.optimizers:
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+        for opt, lrs in zip(self.optimizers, saved):
+            for g, lr in zip(opt.param_groups, lrs):
+                g["lr"] = lr
+        if not was_training:
+            model.eval()
+        return float(loss.detach())
 
     # ------------------------------------------------------------------ #
     # checkpoints: model weights + fast-weight memory + config, together
@@ -127,10 +193,12 @@ class Trainer:
         if state:  # rank0_only under FSDP gives {} on other ranks
             torch.save(state, os.path.join(path, "model.pt"))
         self.cfg.save(os.path.join(path, "rbuild_config.json"))
-        raw_model = getattr(self.model, "module", self.model)
-        inner = getattr(raw_model, "_fsdp_wrapped_module", raw_model)
+        inner = _unwrap(self.model)
         mem = getattr(inner, "memory", None)
         meta = {"memory_writes": int(mem.n_writes) if mem is not None else 0}
+        learner = getattr(inner, "self_learner", None)
+        if learner is not None:
+            meta["self_learning"] = learner.stats()
         with open(os.path.join(path, "meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
         self.log(f"checkpoint saved -> {path} (memory matrix included)")

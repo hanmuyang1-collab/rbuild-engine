@@ -8,13 +8,14 @@ In Colab / Jupyter:
 Without widgets (plain terminal / scripts):
     ui = interactive.launch()          # automatically falls back to prompts
 
-Every field of every config section is exposed. Changing a value re-runs
+Every field of every config section — including the v3 sections (critic,
+noting, thinking, actuation) — is exposed. Changing a value re-runs
 validation + the parameter counter + the naive-vs-optimized cost report
 live. The panel can then build the model in one click.
 
 Also included: `chat(...)` — an interactive generation session where the
-user can tweak sampling values, write facts into the fast-weight memory,
-and inspect/modify the config live.
+user can tweak sampling values, switch thinking modes, write facts into
+the fast-weight memory, and inspect self-learning stats live.
 """
 
 from __future__ import annotations
@@ -26,6 +27,9 @@ import torch
 
 from .config import RBuildConfig, preset
 
+_SECTIONS = ("model", "cache_loop", "parallel", "critic", "noting",
+             "thinking", "actuation", "memory", "vision", "train")
+
 
 # --------------------------------------------------------------------------- #
 # helpers
@@ -33,7 +37,7 @@ from .config import RBuildConfig, preset
 
 def _fields(cfg: RBuildConfig):
     """Yield (section_name, section_obj, field) for every config value."""
-    for sec_name in ("model", "cache_loop", "parallel", "memory", "vision", "train"):
+    for sec_name in _SECTIONS:
         sec = getattr(cfg, sec_name)
         for f in dataclasses.fields(sec):
             yield sec_name, sec, f
@@ -69,6 +73,8 @@ class InteractivePanel:
         boxes = {}
         for sec_name, sec, f in _fields(cfg):
             val = getattr(sec, f.name)
+            if isinstance(val, dict):
+                continue   # structured fields (custom thinking modes) stay programmatic
             label = f.name
             if isinstance(val, bool):
                 widget = w.Checkbox(value=val, description=label, indent=False)
@@ -84,6 +90,8 @@ class InteractivePanel:
                     "branch_ffn": ["moe", "dense"],
                     "precision": ["fp32", "bf16", "fp8"],
                     "optimizer": ["muon", "adamw"],
+                    "mode": ["vit", "encoderless"],
+                    "default_mode": ["fast", "balanced", "deep", "careful", "research"],
                 }.get(f.name)
                 if choices:
                     widget = w.Dropdown(options=choices, value=val, description=label,
@@ -110,7 +118,7 @@ class InteractivePanel:
         self._preset_dd.observe(self._on_preset, names="value")
 
         display(w.VBox([
-            w.HTML("<b>R-Build v2 — every value is yours to change</b>"),
+            w.HTML("<b>R-Build v3 — every value is yours to change</b>"),
             self._preset_dd,
             accordion,
             w.HBox([self._build_btn, self._save_btn]),
@@ -146,9 +154,11 @@ class InteractivePanel:
 
     def _sync_widgets_from_cfg(self):
         for sec_name, sec, f in _fields(self.cfg):
-            wdg = self._widgets[f"{sec_name}.{f.name}"]
+            key = f"{sec_name}.{f.name}"
+            if key not in self._widgets:
+                continue
             val = getattr(sec, f.name)
-            wdg.value = val if val is not None else ""
+            self._widgets[key].value = val if val is not None else ""
 
     def _on_build(self, *_):
         from .model import RBuildModel
@@ -172,10 +182,12 @@ class InteractivePanel:
     # ---------------- console fallback ---------------- #
     def _launch_console(self):
         cfg = self.cfg
-        print("R-Build v2 — interactive configuration (console mode)")
+        print("R-Build v3 — interactive configuration (console mode)")
         print("Press Enter to keep the [default]. Type 'done' at any prompt to finish.\n")
         for sec_name, sec, f in _fields(cfg):
             val = getattr(sec, f.name)
+            if isinstance(val, dict):
+                continue
             raw = input(f"{sec_name}.{f.name} [{val}]: ").strip()
             if raw.lower() == "done":
                 break
@@ -222,20 +234,25 @@ def launch(cfg: Optional[RBuildConfig] = None) -> InteractivePanel:
 
 def chat(model, encode, decode, max_new_tokens: int = 64) -> None:
     """
-    Interactive generation loop with live-modifiable sampling + memory.
+    Interactive generation loop with live-modifiable sampling + memory +
+    thinking modes + self-learning stats.
 
     Commands (type at the prompt):
       /temp <f>      temperature            /topp <f>    nucleus sampling
       /topk <i>      top-k (0 = off)        /maxn <i>    max new tokens
+      /mode <name>   thinking mode (fast/balanced/deep/careful/research,
+                     or anything you minted with thinking_mode.create)
+      /modes         list thinking modes
       /remember ...  write text into fast-weight memory (no training)
       /forget        reset the fast-weight memory
+      /selfstats     critic-verified self-learning stats
       /config        show the live config report
       /quit          exit
-    Anything else is encoded, run through cache-loop -> parallel stages,
-    and decoded back.
+    Anything else is encoded, run through the extraction loop and
+    generative stages, and decoded back.
     """
     temp, topp, topk, maxn = 1.0, 0.9, 0, max_new_tokens
-    print("R-Build interactive session — /help-style commands listed in docstring.")
+    print("R-Build v3 interactive session — /help-style commands listed in docstring.")
     while True:
         try:
             user = input("\nyou> ").strip()
@@ -256,12 +273,20 @@ def chat(model, encode, decode, max_new_tokens: int = 64) -> None:
                 topk = int(arg)
             elif cmd == "/maxn":
                 maxn = int(arg)
+            elif cmd == "/mode":
+                getattr(model.thinking_mode, arg)()
+                print(f"  [thinking] mode -> {arg}")
+            elif cmd == "/modes":
+                for name, knobs in model.thinking_mode.list().items():
+                    print(f"  {name}: {knobs}")
             elif cmd == "/remember":
                 model.remember(encode(arg))
                 print("  [cache] fact written (gradient-free)")
             elif cmd == "/forget":
                 model.memory.reset()
                 print("  [cache] memory reset")
+            elif cmd == "/selfstats":
+                print(f"  [self-learn] {model.self_learn_stats()}")
             elif cmd == "/config":
                 print(model.cfg.report())
             else:
@@ -276,7 +301,7 @@ def chat(model, encode, decode, max_new_tokens: int = 64) -> None:
 
 
 def main():
-    print("R-Build v2 interactive CLI")
+    print("R-Build v3 interactive CLI")
     panel = launch()
     if panel.model is not None:
         print("panel.model is ready.")
