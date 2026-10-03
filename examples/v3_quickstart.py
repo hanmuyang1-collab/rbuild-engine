@@ -5,7 +5,7 @@ R-Build v3 quickstart — every v3 feature in one tiny run.
 
 Covers: counter verification, critic-gated ACT halting, thinking modes
 (built-in + user-created), critic-verified non-separate self-training,
-encoderless VL + VaWU, and native actuation.
+encoderless VL + VaWU, native actuation, and generation watermarking.
 """
 
 import torch
@@ -68,6 +68,13 @@ codec = model.action_codec
 demo = [codec.encode_click(0.25, 0.75), codec.encode_scroll(-2),
         codec.wait_id, codec.type_begin_id, 42, codec.type_end_id]
 print(f"[actuation] {codec.decode_actions(demo)}")
+
+# ---------------------------------------------------------------- watermarking
+cfg.watermark.enabled = True               # green-list bias, secret key, zero params
+wm_out = model.generate(x[:1], max_new_tokens=32, top_p=1.0)
+from rbuild import WatermarkDetector
+det = WatermarkDetector(cfg.watermark, cfg.effective_vocab_size())
+print(f"[watermark] {det.detect(wm_out, skip_prompt=1)}")
 
 # ---------------------------------------------------------------- encoderless VL + VaWU
 frames = 3

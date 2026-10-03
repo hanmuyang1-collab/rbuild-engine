@@ -50,6 +50,8 @@ ANSWERS = {
     "seq_len": None,              # tokens per sequence (int)
     "precision": None,            # "fp32" | "bf16" | "fp8"
     "self_train_every": None,     # consolidate notes every N steps (0 = off)
+    "watermark": None,            # True/False (green-list generation watermark)
+    "watermark_key": None,        # secret key for the watermark
     "data": None,                 # "toy" | "text" | "hf"
     "data_path": None,            # path for "text" (local .txt file)
     "save_dir": None,             # checkpoint directory
@@ -218,6 +220,11 @@ def main():
         "self_train_every", "consolidate verified notes every N steps (0 = off)",
         0 if not cfg.noting.enabled else 25, int)
     cfg.train.grad_accum = 1
+    cfg.watermark.enabled = ask_bool(
+        "watermark", "watermark generated text (provable it's from YOUR model)",
+        False, hint="green-list logit bias with a secret key; zero params")
+    if cfg.watermark.enabled:
+        cfg.watermark.key = ask("watermark_key", "secret watermark key", "rbuild-v3")
 
     # ---- 8. data -------------------------------------------------------- #
     print("\nSTEP 8 — data source")
