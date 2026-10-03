@@ -1,26 +1,36 @@
 """
-R-Build v2 — fully user-modifiable configuration.
+R-Build v3 — fully user-modifiable configuration.
 
 Every value in the engine lives here and can be changed:
-  - programmatically:      cfg = RBuildConfig(); cfg.parallel.n_branches = 8
+  - programmatically:      cfg = RBuildConfig(); cfg.critic.n_critics = 8
   - interactively:         rbuild.interactive.launch()  (widgets in Colab/Jupyter,
                            console prompts elsewhere)
   - from the CLI:          python -m rbuild.interactive
 
-The config is organized in five sections:
+Sections:
 
   ModelConfig      — sizes of the network itself
-  CacheLoopConfig  — the sequential "single line" stage that loops to pull
-                     the fast-weight memory cache
-  ParallelConfig   — the parallel stages whose branches bundle outputs and
-                     push them to the next parallel stage
+  CacheLoopConfig  — the sequential "single line" extraction stage that loops
+                     to pull the fast-weight memory cache
+  ParallelConfig   — the parallel generative stages whose branches bundle
+                     outputs and push them to the next parallel stage
+  CriticConfig     — v3: X parallel critic experts (more capacity than the
+                     working experts), ACT-style halting of the extraction
+                     loop until Y critics are satisfied
+  NotingConfig     — v3: noting experts + critic-verified, non-separate
+                     self-training (learn while running, low RAM)
+  ThinkingConfig   — v3: default thinking mode + user-created modes
+  ActuationConfig  — v3: native action tokens (the model clicks by itself)
   MemoryConfig     — the gradient-free fast-weight delta-rule memory
-  VisionConfig     — ViT tower for image/video soft tokens (blind by default)
+  VisionConfig     — ViT tower *or* encoderless vision, plus VaWU whole-video
+                     summary tokens (blind by default)
   TrainConfig      — Muon / WSD / precision / batching / cost model
 
 Validation and derived counters (parameters, active parameters, estimated
 training cost with the naive-vs-optimized comparison) run on demand via
-`cfg.report()` and automatically inside the interactive panel.
+`cfg.report()` and automatically inside the interactive panel. The counter
+mirrors the v3 module tree exactly — including every critic, note-taker,
+and action head — so the printed number matches a built model.
 """
 
 from __future__ import annotations
@@ -58,16 +68,13 @@ class CacheLoopConfig:
     """
     Stage A — the *single line* of layers that loops to pull cache.
 
-    A shared line of `n_layers` blocks is applied `n_loops` times. Every loop
-    iteration performs a delta-rule *read* against the fast-weight memory
-    cache and injects the retrieved value into the residual stream, so the
-    state is progressively refined by what the cache holds.
-
-    Set `share_loop_weights=True` (default) so the loop re-uses the same
-    weights — this is what makes the stage a true loop rather than a stack.
+    In v3 this is the *extraction loop*: with critics enabled it runs
+    adaptively — at most `critic.max_loops` iterations, halting per token
+    (ACT-style) once the critics are satisfied. `n_loops` remains the exact
+    loop count when critics are disabled.
     """
     n_layers: int = 2                # blocks in the single line
-    n_loops: int = 4                 # how many times the line loops
+    n_loops: int = 4                 # loop count (critics off) / default cap reference
     share_loop_weights: bool = True  # reuse weights across loops
     memory_read_every: int = 1       # pull cache every k-th loop iteration
     use_mod_routing: bool = True     # MoD: only top-p tokens hit each block
@@ -77,13 +84,12 @@ class CacheLoopConfig:
 @dataclass
 class ParallelConfig:
     """
-    Stage B — the parallel stages.
+    Stage B — the parallel generative stages.
 
     Each stage owns `n_branches` layer-branches that run in parallel over the
-    same input. Their outputs are *bundled* by a learned gate (or mean /
-    concat+project, see `bundle_mode`) and the bundle is pushed to the next
-    stage. During generation each stage's bundle is what produces the hidden
-    state that the next parallel stage consumes.
+    same input, plus (v3, `critic.stage_critics`) a panel of X critic experts
+    with more capacity than the working experts. Outputs are *bundled* and
+    pushed to the next stage.
     """
     n_stages: int = 3                # how many parallel stages
     n_branches: int = 4              # parallel branches per stage
@@ -98,6 +104,96 @@ class ParallelConfig:
     dense_ffn_dim: Optional[int] = None   # used when branch_ffn == "dense"
     use_mod_routing: bool = True     # MoD on parallel branches
     mod_capacity: float = 0.75
+
+
+@dataclass
+class CriticConfig:
+    """
+    v3 — critic experts and ACT-style adaptive halting.
+
+    The extraction loop runs until at least `y_critics` of the X parallel
+    critics are satisfied (per-token halting is ACT-style: cumulative
+    satisfaction mass crosses 1 - halt_eps). Each generative stage carries
+    its own panel of X critics, each with `critic_capacity_mult` times the
+    capacity of a working expert — verification needs headroom to be a
+    trustworthy gate. `halt_loss_weight` scales the ACT ponder cost
+    (loops taken + remainders) added to the training loss.
+
+    enabled=False removes every critic parameter and restores the exact
+    v2 architecture.
+    """
+    enabled: bool = True
+    n_critics: int = 4               # X — parallel critic experts per panel
+    critic_capacity_mult: float = 2.0  # critic hidden = working-expert dim x this
+    critic_hidden: Optional[int] = None  # explicit override (None -> from mult)
+    y_critics: int = 2               # Y — satisfied critics needed to halt/verify
+    threshold: float = 0.6           # per-critic "satisfied" score
+    max_loops: int = 8               # extraction-loop cap (ACT)
+    min_loops: int = 1               # never halt before this many iterations
+    halt_eps: float = 0.01           # ACT halt threshold epsilon
+    halt_loss_weight: float = 0.01   # weight of the ACT ponder cost
+    stage_critics: bool = True       # critic panel on every generative stage
+
+
+@dataclass
+class NotingConfig:
+    """
+    v3 — noting experts + critic-verified non-separate self-training.
+
+    During normal forwards (including generation), noting experts propose
+    candidate facts from the final hidden states. The generative stages'
+    critics verify each note; verified notes are (a) written into the
+    fast-weight memory immediately (gradient-free — the model learns while
+    running, ~zero extra RAM) and (b) queued in a CPU fp16 buffer so
+    `Trainer.self_train_step()` can consolidate them into the slow weights
+    with a real gradient step. No separate training phase, no separate
+    verification phase: running and learning happen in parallel.
+    """
+    enabled: bool = True
+    n_noting_experts: int = 2        # separate note-taking experts
+    note_hidden: Optional[int] = None  # None -> d_model
+    verify_y_critics: int = 2        # critics that must approve a note
+    verify_threshold: float = 0.6    # mean critic satisfaction to accept
+    min_confidence: float = 0.5      # note-taker confidence floor
+    write_to_memory: bool = True     # verified notes -> fast-weight memory now
+    memory_write_lr: float = 0.5     # delta-rule lr for self-observed writes
+    buffer_capacity: int = 4096      # CPU fp16 note buffer (low RAM)
+    self_train_batch: int = 128      # notes per consolidation step
+    observe_in_training: bool = False  # also take notes during fit()
+
+
+@dataclass
+class ThinkingConfig:
+    """
+    v3 — thinking modes. Runtime presets that retune the adaptive machinery
+    (max loops, Y critics, halt threshold, sampling, self-observation)
+    without rebuilding the model. Create your own:
+
+        model.thinking_mode.create("exam", max_loops=10, y_critics=3)
+        model.thinking_mode.exam()
+
+    `custom_modes` persists user-created modes into checkpoints.
+    """
+    default_mode: str = "balanced"
+    save_modes: bool = True
+    custom_modes: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ActuationConfig:
+    """
+    v3 — native actuation: reserved action tokens let the model click,
+    scroll, type and wait *by generating a token* — no external tool loop.
+
+    The output space grows by `n_action_tokens` (1 wait + grid^2 clicks +
+    2*scroll_steps scrolls + type begin/end). A dedicated ActuationHead
+    produces the action columns of the logits, so the action space stays
+    clean even with tied embeddings. Ground the head with vision
+    (encoderless + VaWU recommended: the screen is just frames).
+    """
+    enabled: bool = False
+    screen_grid: int = 64            # click grid resolution (g x g cells)
+    scroll_steps: int = 8            # discrete scroll magnitudes (up/down)
 
 
 @dataclass
@@ -118,16 +214,22 @@ class MemoryConfig:
 @dataclass
 class VisionConfig:
     """
-    VL support (v2.1). Default is *blind*: enabled=False means the vision
-    tower is never built and the model is bit-identical to the text-only
-    v2.0 path. Set enabled=True and image_token_id to go multimodal.
+    VL support. Default is *blind*: enabled=False means no vision machinery
+    is built at all and the model is bit-identical to the text-only path.
 
-    Images (or sampled video frames) are encoded by a ViT tower, projected
-    to d_model, and spliced into the token stream at `image_token_id`
-    placeholder positions — downstream stages just see more tokens.
+    mode="vit"         — v2.1 ViT tower over patches (video = frame tokens).
+    mode="encoderless" — v3: no vision encoder at all. Patches are
+                         normalized and projected straight into d_model;
+                         the LLM itself does the seeing.
+    vawu=True          — v3: Video-as-Whole-Understanding. A learned-query
+                         attention pooler compresses all frames into
+                         `vawu_tokens` whole-video summary tokens, prepended
+                         to the frame stream: the model reads the video as
+                         a whole before its parts.
     """
     enabled: bool = False            # False = blind (text-only), zero overhead
     image_token_id: Optional[int] = None  # reserved placeholder id in the vocab
+    mode: str = "vit"                # "vit" | "encoderless" (v3: no encoder)
     image_size: int = 224
     patch_size: int = 14
     channels: int = 3
@@ -137,9 +239,12 @@ class VisionConfig:
     vit_ffn_mult: float = 4.0
     use_cls_token: bool = False
     freeze_vision: bool = False      # train projector only (cheap VL bootstrap)
-    # video (s4-style whole-video understanding)
+    # video
     video: bool = True               # allow (B, frames, C, H, W) inputs
     max_video_frames: int = 16       # learned frame-position table size
+    # v3: Video-as-Whole-Understanding
+    vawu: bool = False               # prepend whole-video summary tokens
+    vawu_tokens: int = 4             # how many whole-video tokens
 
 
 @dataclass
@@ -158,6 +263,9 @@ class TrainConfig:
     warmup_steps: int = 100
     cooldown_frac: float = 0.4       # WSD decay tail fraction
     grad_clip: float = 1.0
+    # v3 self-training consolidation
+    self_train_every: int = 0        # >0: consolidate verified notes every N steps
+    self_train_lr: float = 3e-4      # lr for the consolidation step
     # speed stack
     precision: str = "bf16"          # "fp32" | "bf16" | "fp8"
     chunked_ce: bool = True          # chunked cross-entropy (memory saver)
@@ -180,15 +288,44 @@ class RBuildConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     cache_loop: CacheLoopConfig = field(default_factory=CacheLoopConfig)
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
+    critic: CriticConfig = field(default_factory=CriticConfig)
+    noting: NotingConfig = field(default_factory=NotingConfig)
+    thinking: ThinkingConfig = field(default_factory=ThinkingConfig)
+    actuation: ActuationConfig = field(default_factory=ActuationConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
+
+    # ------------------------------------------------------------------ #
+    # derived sizes shared by the counter and the model builder
+    # ------------------------------------------------------------------ #
+    def resolved_expert_dim(self) -> int:
+        m, p = self.model, self.parallel
+        return p.expert_ffn_dim or max(8, int(m.d_model * p.ffn_mult / p.n_experts))
+
+    def resolved_critic_hidden(self) -> int:
+        c = self.critic
+        return c.critic_hidden or max(16, int(self.resolved_expert_dim()
+                                              * c.critic_capacity_mult))
+
+    def resolved_note_hidden(self) -> int:
+        return self.noting.note_hidden or self.model.d_model
+
+    def n_action_tokens(self) -> int:
+        if not self.actuation.enabled:
+            return 0
+        a = self.actuation
+        return 1 + a.screen_grid * a.screen_grid + 2 * a.scroll_steps + 2
+
+    def effective_vocab_size(self) -> int:
+        return self.model.vocab_size + self.n_action_tokens()
 
     # ------------------------------------------------------------------ #
     # validation
     # ------------------------------------------------------------------ #
     def validate(self) -> None:
         m, cl, p, mem = self.model, self.cache_loop, self.parallel, self.memory
+        c, n, a = self.critic, self.noting, self.actuation
         assert m.d_model % m.n_heads == 0 or m.head_dim is not None, \
             "d_model must divide n_heads unless head_dim is set"
         assert m.n_heads % m.n_kv_heads == 0, "n_heads must be a multiple of n_kv_heads"
@@ -202,13 +339,37 @@ class RBuildConfig:
         assert mem.key_dim >= 8 and mem.value_dim >= 8
         assert self.train.precision in ("fp32", "bf16", "fp8")
         assert self.train.optimizer in ("muon", "adamw")
+        # v3: critics
+        if c.enabled:
+            assert c.n_critics >= 1, "need at least one critic"
+            assert 1 <= c.y_critics <= c.n_critics, \
+                "y_critics must be within [1, n_critics]"
+            assert 0.0 <= c.threshold <= 1.0 and 0.0 < c.halt_eps < 1.0
+            assert c.max_loops >= 1 and 1 <= c.min_loops <= c.max_loops
+            assert c.critic_capacity_mult > 0
+        # v3: noting
+        if n.enabled:
+            assert n.n_noting_experts >= 1
+            assert 0.0 <= n.verify_threshold <= 1.0 and 0.0 <= n.min_confidence <= 1.0
+            if c.enabled:
+                assert 1 <= n.verify_y_critics <= c.n_critics
+            if n.write_to_memory:
+                assert mem.enabled, "noting.write_to_memory requires memory.enabled"
+        # v3: actuation
+        if a.enabled:
+            assert a.screen_grid >= 4 and a.scroll_steps >= 1
         v = self.vision
         if v.enabled:
             assert v.image_token_id is not None, \
                 "vision.enabled=True requires an image_token_id placeholder"
             assert v.image_size % v.patch_size == 0, "image_size must divide patch_size"
+            assert v.mode in ("vit", "encoderless")
             vd = v.vit_dim or m.d_model
-            assert vd % v.vit_heads == 0, "vit_dim must divide vit_heads"
+            if v.mode == "vit":
+                assert vd % v.vit_heads == 0, "vit_dim must divide vit_heads"
+            if v.vawu:
+                assert v.video, "vawu requires vision.video=True"
+                assert v.vawu_tokens >= 1
 
     # ------------------------------------------------------------------ #
     # parameter counter (naive vs optimized stack)
@@ -216,18 +377,19 @@ class RBuildConfig:
     def count_parameters(self) -> Dict[str, int]:
         """
         Static count of total / active (per-token) parameters. The counting
-        mirrors the module tree in rbuild.model exactly, so the printed
-        number matches a built model's `sum(p.numel())` — the counter is
-        the verification tool, not an approximation.
+        mirrors the module tree in rbuild.model exactly — v3 critics, noting
+        experts, actuation head and both vision modes included — so the
+        printed number matches a built model's `sum(p.numel())`.
         """
         m, cl, p, mem = self.model, self.cache_loop, self.parallel, self.memory
+        c, n, a = self.critic, self.noting, self.actuation
         self.validate()
         d = m.d_model
         hd = m.resolved_head_dim()
 
         attn = d * (m.n_heads * hd) + 2 * d * (m.n_kv_heads * hd) + (m.n_heads * hd) * d
 
-        exp_dim = p.expert_ffn_dim or max(8, int(d * p.ffn_mult / p.n_experts))
+        exp_dim = self.resolved_expert_dim()
         ns = max(1, p.n_shared_experts)
         shared_dim = max(exp_dim, int(d * 4 / ns))   # shared stays dense-sized
         expert = 3 * d * exp_dim
@@ -242,18 +404,27 @@ class RBuildConfig:
         def block(kind: str) -> int:
             return attn + ffn(kind) + 2 * d          # norm1 + norm2
 
+        # --- v3 critic panel (per location) --------------------------- #
+        ch = self.resolved_critic_hidden()
+        critic_expert = d * ch + ch * ch + ch + 1    # w1, w2, score(+bias)
+        critic_panel = c.n_critics * critic_expert if c.enabled else 0
+
         # Stage A: cache-loop line (dense FFN blocks) + pull machinery
         line_blocks = cl.n_layers * (1 if cl.share_loop_weights else cl.n_loops)
         cache_line = line_blocks * block("dense") \
             + d + d * mem.key_dim + d + d   # mod router, mem key_proj, read gate, read_norm
+        cache_line += critic_panel          # v3: extraction-loop critics
         cache_line_active = cl.n_layers * cl.n_loops * block("dense")  # compute repeats per loop
+        cache_line_active += critic_panel * (c.max_loops if c.enabled else 0)
 
-        # Stage B: parallel stages
+        # Stage B: parallel generative stages
         stage = p.n_branches * block(p.branch_ffn) + d + d   # mod router + out_norm
         if p.bundle_mode == "gate":
             stage += d * p.n_branches + p.n_branches
         elif p.bundle_mode == "concat":
             stage += (p.n_branches * d) * d
+        if c.enabled and c.stage_critics:
+            stage += critic_panel           # v3: generative-stage critics
 
         def block_active(kind: str) -> int:
             active_ffn = (d * p.n_experts + p.expert_top_k * expert + ns * shared) \
@@ -265,40 +436,69 @@ class RBuildConfig:
             stage_active += d * p.n_branches + p.n_branches
         elif p.bundle_mode == "concat":
             stage_active += (p.n_branches * d) * d
+        if c.enabled and c.stage_critics:
+            stage_active += critic_panel
         parallel_total = p.n_stages * stage
         parallel_active = p.n_stages * stage_active
 
-        embed = m.vocab_size * d
-        head = 0 if m.tie_embeddings else m.vocab_size * d
+        # --- v3 noting experts ---------------------------------------- #
+        noting_params = 0
+        if n.enabled:
+            nh = self.resolved_note_hidden()
+            noting_params = n.n_noting_experts * (
+                d * nh + nh * mem.key_dim + nh * mem.value_dim + nh + 1)
+
+        # --- v3 actuation ---------------------------------------------- #
+        n_act = self.n_action_tokens()
+        actuation_params = n_act * d        # dedicated action head
+        eff_vocab = self.effective_vocab_size()
+
+        embed = eff_vocab * d
+        head = 0 if m.tie_embeddings else eff_vocab * d
         fact_proj = d * mem.key_dim + d * mem.value_dim
         final_norm = d
 
-        # vision tower (mirrors rbuild.vision.VisionTower exactly)
+        # vision tower (mirrors rbuild.vision.VisionTower exactly, both modes)
         vision_params = 0
         if self.vision.enabled:
             v = self.vision
             vd = v.vit_dim or d
             g = v.image_size // v.patch_size
-            tpi = g * g + (1 if v.use_cls_token else 0)
-            vit_block = 4 * vd * vd + 2 * vd + 3 * vd * int(vd * v.vit_ffn_mult)
-            vision_params = (
-                v.channels * vd * v.patch_size * v.patch_size   # patch conv
-                + tpi * vd                                       # pos embed
-                + (vd if v.use_cls_token else 0)                 # cls token
-                + v.vit_layers * vit_block
-                + vd                                             # out norm
-                + vd * d                                         # projector
-                + (v.max_video_frames * d if v.video else 0)     # frame embed
-            )
+            if v.mode == "vit":
+                tpi = g * g + (1 if v.use_cls_token else 0)
+                vit_block = 4 * vd * vd + 2 * vd + 3 * vd * int(vd * v.vit_ffn_mult)
+                vision_params = (
+                    v.channels * vd * v.patch_size * v.patch_size   # patch conv
+                    + tpi * vd                                       # pos embed
+                    + (vd if v.use_cls_token else 0)                 # cls token
+                    + v.vit_layers * vit_block
+                    + vd                                             # out norm
+                    + vd * d                                         # projector
+                )
+            else:  # encoderless — no encoder, patch conv straight to d_model
+                vision_params = (
+                    v.channels * d * v.patch_size * v.patch_size    # patch conv
+                    + g * g * d                                      # pos embed
+                    + d                                              # patch norm
+                )
+            vision_params += v.max_video_frames * d if v.video else 0
+            if v.vawu and v.video:
+                vision_params += v.vawu_tokens * d + 4 * d * d + d   # queries, MHA, norm
 
-        total = cache_line + parallel_total + embed + head + fact_proj + final_norm + vision_params
+        total = (cache_line + parallel_total + embed + head + fact_proj + final_norm
+                 + vision_params + noting_params + actuation_params)
         active = cache_line_active * cl.mod_capacity + parallel_active * p.mod_capacity \
-            + embed + head + fact_proj + final_norm + vision_params
+            + embed + head + fact_proj + final_norm + vision_params \
+            + noting_params + actuation_params
         return {
             "total_params": int(total),
             "active_params_per_token": int(active),
             "cache_loop_params": int(cache_line),
             "parallel_params": int(parallel_total),
+            "critic_params": int((critic_panel if c.enabled else 0)
+                                 * (1 + (p.n_stages if c.stage_critics else 0))),
+            "noting_params": int(noting_params),
+            "actuation_params": int(actuation_params),
             "embed_params": int(embed + head),
             "vision_params": int(vision_params),
             "memory_matrix": int(mem.key_dim * mem.value_dim if mem.enabled else 0),
@@ -339,23 +539,56 @@ class RBuildConfig:
         c = self.count_parameters()
         cost = self.estimate_cost()
         def fmt(n): return f"{n/1e9:.3f}B" if n >= 1e9 else f"{n/1e6:.2f}M"
+        cr = self.critic
+        if cr.enabled:
+            halt_line = (f"ACT, until {cr.y_critics}/{cr.n_critics} critics "
+                         f"satisfied, max {cr.max_loops} loops")
+            critic_line = (f"{cr.n_critics} per panel, hidden "
+                           f"{self.resolved_critic_hidden()} "
+                           f"({cr.critic_capacity_mult}x working expert)"
+                           f", stage panels={'on' if cr.stage_critics else 'off'}")
+        else:
+            halt_line = "off (fixed loops)"
+            critic_line = "off"
+        if self.noting.enabled:
+            noting_line = (f"{self.noting.n_noting_experts} note-takers, critic-verified "
+                           f"({self.noting.verify_y_critics}y@{self.noting.verify_threshold})")
+        else:
+            noting_line = "off"
+        if self.actuation.enabled:
+            act_line = (f"on (+{self.n_action_tokens()} action tokens, "
+                        f"grid {self.actuation.screen_grid}^2)")
+        else:
+            act_line = "off"
+        if self.vision.enabled:
+            vision_line = (f"{self.vision.mode} ({c['vision_params']/1e6:.2f}M, "
+                           f"video={'on' if self.vision.video else 'off'}"
+                           f", vawu={'on' if self.vision.vawu else 'off'})")
+        else:
+            vision_line = "blind (off)"
         lines = [
-            "R-Build configuration report",
+            "R-Build v3 configuration report",
             "=" * 56,
-            f"  cache-loop line   : {self.cache_loop.n_layers} layers x {self.cache_loop.n_loops} loops"
-            f"  (shared={self.cache_loop.share_loop_weights}, pull every {self.cache_loop.memory_read_every})",
-            f"  parallel stages   : {self.parallel.n_stages} stages x {self.parallel.n_branches} branches"
+            f"  extraction loop   : {self.cache_loop.n_layers} layers"
+            f"  (shared={self.cache_loop.share_loop_weights}, pull every"
+            f" {self.cache_loop.memory_read_every})",
+            f"  adaptive halting  : {halt_line}",
+            f"  generative stages : {self.parallel.n_stages} stages x {self.parallel.n_branches} branches"
             f"  (bundle={self.parallel.bundle_mode})",
+            f"  critic experts    : {critic_line}",
             f"  MoE per branch    : {self.parallel.n_experts} experts, top-{self.parallel.expert_top_k},"
             f" {self.parallel.n_shared_experts} shared",
+            f"  noting experts    : {noting_line}",
+            f"  thinking mode     : {self.thinking.default_mode}"
+            + (f" (+{len(self.thinking.custom_modes)} custom)" if self.thinking.custom_modes else ""),
+            f"  native actuation  : {act_line}",
             f"  fast-weight memory: {'on' if self.memory.enabled else 'off'}"
             f" (key={self.memory.key_dim}, value={self.memory.value_dim})",
-            f"  vision            : {'blind (off)' if not self.vision.enabled else 'on'}"
-            + (f" ({c['vision_params']/1e6:.2f}M tower, {self.vision.vit_layers} ViT layers"
-               f", video={'on' if self.vision.video else 'off'})" if self.vision.enabled else ""),
+            f"  vision            : {vision_line}",
             "-" * 56,
             f"  total params      : {fmt(c['total_params'])}",
             f"  active per token  : {fmt(c['active_params_per_token'])}",
+            f"  critics / noting  : {fmt(c['critic_params'])} / {fmt(c['noting_params'])}",
             "-" * 56,
             f"  cost (naive)      : ${cost['cost_naive_usd']:,.0f}  ({cost['hours_naive']:,.1f} h)",
             f"  cost (optimized)  : ${cost['cost_optimized_usd']:,.0f}  ({cost['hours_optimized']:,.1f} h)",
@@ -373,9 +606,12 @@ class RBuildConfig:
     def from_dict(cls, d: Dict[str, Any]) -> "RBuildConfig":
         cfg = cls()
         for section, values in d.items():
-            sec = getattr(cfg, section)
+            sec = getattr(cfg, section, None)
+            if sec is None:
+                continue            # forward/backward compatible section skip
             for k, v in values.items():
-                setattr(sec, k, v)
+                if hasattr(sec, k):
+                    setattr(sec, k, v)
         return cfg
 
     def save(self, path: str) -> None:
@@ -396,12 +632,12 @@ def _preset(name: str) -> RBuildConfig:
     cfg = RBuildConfig()
     # Counter-verified against the ladder:
     #   s1 20B-A3.4B | s2 90B-A8.9B | s3 118B-A19.6B | s4 219B-A40.9B | s5 411B-A61.5B
-    # (all within ~4% under the v2 loop-cache + parallel-bundle architecture;
-    #  s3 deliberately goes wider-per-token, not deeper)
+    # (working-expert sizes are the v2 ladder; v3 critics + noting experts add
+    #  their counter-verified parameters on top — report() shows them split out)
     ladder = {
         "s1": dict(d_model=2048, n_heads=16, n_kv_heads=4, n_loops=6,
                    n_stages=7, n_branches=6, n_experts=128, expert_top_k=8,
-                   expert_ffn_dim=512, key_dim=512),                    # 19.9B / 3.3B
+                   expert_ffn_dim=512, key_dim=512),                    # 19.9B / 3.3B (v2 working stack)
         "s2": dict(d_model=2560, n_heads=20, n_kv_heads=5, n_loops=8,
                    n_stages=6, n_branches=9, n_experts=160, expert_top_k=10,
                    expert_ffn_dim=1280, key_dim=640),                   # 90.6B / 8.9B
@@ -423,6 +659,7 @@ def _preset(name: str) -> RBuildConfig:
     cfg.model.n_kv_heads = v["n_kv_heads"]
     cfg.model.vocab_size = 128000
     cfg.cache_loop.n_loops = v["n_loops"]
+    cfg.critic.max_loops = v["n_loops"]      # v3: the ladder's loop count is the ACT cap
     cfg.parallel.n_stages = v["n_stages"]
     cfg.parallel.n_branches = v["n_branches"]
     cfg.parallel.n_experts = v["n_experts"]
