@@ -1,63 +1,67 @@
-# R-Build v2.1
+# R-Build v3
 
-**A fully user-modifiable, open-source LLM architecture + training-speed engine.**
+**A fully user-modifiable, open-source LLM architecture + training-speed engine — now self-governing.**
 Every knob is yours: programmatically, through an interactive widget panel in
 Colab/Jupyter, or a console prompt anywhere else.
 
-## Architecture (v2)
+## What's new in v3
 
 ```
-tokens ─► embed ─► CACHE-LOOP LINE ─► PARALLEL STAGE 1 ─► ... ─► PARALLEL STAGE N ─► head
-                    │  single line of   │  n_branches parallel blocks per stage;
-                    │  layers, looped   │  outputs bundled (gate / mean / concat)
-                    │  n_loops times,   │  and pushed to the next parallel stage
-                    │  pulling the      │
-                    │  fast-weight      ▼
-                    │  cache each loop  logits
+tokens ─► embed ─► EXTRACTION LOOP ─► PARALLEL STAGE 1 ─► ... ─► PARALLEL STAGE N ─► head
+                    │  single line of    │  n_branches working experts per stage
+                    │  layers, ACT-      │  + X CRITIC EXPERTS per stage
+                    │  halted: runs      │  (more capacity than the workers —
+                    │  until Y critics   │  they verify the bundle and gate
+                    │  are satisfied,    │  the self-training pipeline)
+                    │  pulling the       │
+                    │  fast-weight       ▼
+                    │  cache each loop   logits (+ native action tokens)
                     ▼
-            FastWeightMemory — delta-rule key→value matrix,
-            gradient-free fact writes, saved with every checkpoint
+            FastWeightMemory — delta-rule key→value matrix.
+            v3: critic-verified notes written by the model's own
+            noting experts — it learns WHILE running, no separate phase.
 ```
 
-- **Stage A — cache loop ("first set of layers in a single line, loops to pull cache")**:
-  one line of blocks, applied `cache_loop.n_loops` times (shared weights by default),
-  performing a delta-rule **read** against the fast-weight cache every
-  `memory_read_every` loops and injecting it through a learned gate.
-- **Stage B — parallel bundle stages ("multiple parallel layers ... bundle to push
-  to the next set of parallel layers")**: each stage runs `n_branches` blocks in
-  parallel over the same input and **bundles** them (`bundle_mode`: `gate`,
-  `mean`, or `concat`), pushing the bundle onward. The final bundle produces logits.
+1. **Critic-gated adaptive extraction (ACT-style halting).** The old fixed
+   cache loop is now an *extraction loop*: after each iteration, X parallel
+   critic experts score every token's hidden state. Tokens halt as their
+   cumulative satisfaction crosses 1 (ACT); the loop early-exits once Y
+   critics are satisfied on average. An ACT ponder cost (loops taken +
+   remainders) joins the training loss, so the model learns to spend only
+   the compute each token needs.
+2. **Critic experts on the generative layers.** Every parallel stage carries
+   its own panel of X critics, each with `critic_capacity_mult`× the width of
+   a working expert — verification gets more capacity than generation.
+3. **Noting experts + critic-verified non-separate self-training.** Separate
+   note-taker experts watch the final hidden states during normal use
+   (generation included) and propose facts. Critics verify each note;
+   verified notes are written into the fast-weight memory *gradient-free,
+   immediately* (the model learns while running, ~zero extra RAM) and queued
+   in a CPU fp16 buffer for `Trainer.self_train_step()` to consolidate into
+   the slow weights. Running and learning are the same pass.
+4. **Thinking-mode creator.** `model.thinking_mode.<mode>(<value>)` retunes
+   loops, Y-critics, thresholds and sampling live — built-ins
+   `fast/balanced/deep/careful/research`, and mint your own with
+   `model.thinking_mode.create("exam", max_loops=10, y_critics=3)`.
+5. **VL & VaWU without a vision encoder.** `vision.mode="encoderless"`:
+   patches are normalized and projected straight into `d_model` — the LLM
+   itself is the vision encoder. `vision.vawu=True` adds
+   Video-as-Whole-Understanding: learned-query attention pooling compresses
+   all frames into whole-video summary tokens, prepended to the frame
+   stream. (The v2.1 ViT tower remains as `vision.mode="vit"`.)
+6. **Native actuation.** `actuation.enabled=True` reserves action tokens in
+   the output space — click(x, y) on a screen grid, scroll, type, wait —
+   produced by a dedicated action head. Generating a token *is* the action;
+   no external tool loop.
 
-Carried over from the R-Build optimized stack: **MoD routing** (top-p tokens per
-block), **fine-grained MoE + dense-sized shared expert**, **Muon** optimizer,
-**WSD** schedule, **chunked cross-entropy**, and the **fast-weight delta-rule
-memory** (facts written without any training step).
-
-## Vision-language (v2.1)
-
-Complete VL support via a ViT tower (`VisionTower`): images — or sampled video
-frames — are encoded, projected to `d_model`, and spliced into the token stream
-at `vision.image_token_id` placeholder positions. The cache loop and parallel
-stages just see more tokens; loss is automatically masked at vision positions;
-video gets learned per-frame position embeddings (whole-video understanding).
-
-```python
-cfg = preset("s1")
-cfg.vision.enabled = True
-cfg.vision.image_token_id = 128001     # a reserved id in your tokenizer vocab
-model = RBuildModel(cfg)               # tower built, counter includes it exactly
-logits, loss = model(ids, targets=ids, images=imgs)   # imgs: (B, n_img_or_frames, C, H, W)
-```
-
-Default is **blind**: `vision.enabled=False` builds no tower at all and is
-bit-identical to the text-only path. `vision.freeze_vision=True` trains only
-the projector for a cheap VL bootstrap. All `vision.*` values are in the
-interactive panel like everything else.
+Everything v3 can be switched off independently; with `critic`, `noting`,
+`actuation` and `vision` all disabled the architecture is bit-identical to
+v2, and the parameter counter still matches the built model exactly.
 
 ## Install
 
 ```bash
-pip install git+https://github.com/hanmuyang1-collab/rbuild-engine   # straight from GitHub
+pip install git+https://github.com/hanmuyang1-collab/rbuild-engine@v3   # v3 branch
 pip install .                       # or from a local clone
 pip install .[notebook]             # + ipywidgets for the interactive panel
 pip install .[train]                # + transformers/datasets for the training script
@@ -68,9 +72,9 @@ pip install .[train]                # + transformers/datasets for the training s
 ```python
 from rbuild import RBuildConfig, RBuildModel, Trainer, preset
 
-cfg = preset("s1")                  # counter-verified: 19.9B total / 3.3B active
-cfg.parallel.n_branches = 8         # change anything
-cfg.cache_loop.n_loops = 10
+cfg = preset("s1")                  # counter-verified: 20.0B total / 3.5B active
+cfg.critic.n_critics = 8            # X critics per panel — change anything
+cfg.critic.y_critics = 4            # Y must be satisfied to halt extraction
 cfg.train.precision = "bf16"
 print(cfg.report())                 # params + naive-vs-optimized cost, always both
 
@@ -78,54 +82,87 @@ model = RBuildModel(cfg)
 assert sum(p.numel() for p in model.parameters()) == cfg.count_parameters()["total_params"]
 ```
 
+### Thinking modes
+
+```python
+model.thinking_mode.deep()                    # built-in: longer extraction, stricter critics
+model.thinking_mode.deep(12)                  # positional value = max_loops override
+model.thinking_mode.create("exam", max_loops=10, y_critics=3,
+                           halt_threshold=0.9, temperature=0.2)
+model.thinking_mode.exam()                    # your mode is now native
+model.thinking_mode.list()                    # all modes + knobs
+```
+
+### Self-training while running
+
+```python
+model.eval()
+out = model.generate(ids)           # noting experts observe this pass
+model.self_learn_stats()            # {'notes_verified': ..., 'accept_rate': ..., 'buffered': ...}
+
+trainer = Trainer(model, cfg)
+trainer.self_train_step()           # consolidate verified notes into slow weights
+# or automatically during fit: cfg.train.self_train_every = 100
+```
+
+### Native actuation
+
+```python
+cfg.actuation.enabled = True
+cfg.actuation.screen_grid = 64      # 64x64 click grid
+model = RBuildModel(cfg)
+out = model.generate(ids)
+for action in model.action_codec.decode_actions(out[0]):
+    ...                             # Action(click, x=0.31, y=0.81), Action(scroll, dy=-2), ...
+```
+
+### Vision: ViT, encoderless, VaWU
+
+```python
+cfg.vision.enabled = True
+cfg.vision.mode = "encoderless"     # v3: no vision encoder at all
+cfg.vision.vawu = True              # whole-video summary tokens
+cfg.vision.image_token_id = 128001  # reserved placeholder id
+model = RBuildModel(cfg)
+logits, loss = model(ids, targets=ids, images=imgs)   # imgs: (B, frames, C, H, W)
+```
+
 ### Interactive panel (Colab / Jupyter)
 
 ```python
 from rbuild import interactive
-ui = interactive.launch()           # widgets for every value, live report
-# ... tweak, click "Build model" ...
+ui = interactive.launch()           # widgets for every value, v3 sections included
 model = ui.model
-```
-
-Outside notebooks the same call falls back to console prompts.
-
-### Interactive generation + memory
-
-```python
 interactive.chat(model, encode, decode)
-# /remember <text>   gradient-free fact write into the fast-weight cache
-# /temp /topp /topk /maxn          live sampling control
-# /forget            reset the cache      /config   live report
-```
-
-### Train
-
-```python
-trainer = Trainer(model, cfg)       # Muon + WSD + chunked CE + bf16/fp8 flag
-trainer.fit(batches)                # batches yield (input_ids, targets)
-trainer.save_checkpoint("ckpt/")    # weights + memory matrix + config, together
-model2 = Trainer.load_checkpoint("ckpt/")
+# /mode deep      switch thinking mode live      /modes     list modes
+# /selfstats      self-learning counters         /remember  gradient-free fact write
 ```
 
 ## Stage ladder presets (continued-training path)
 
-| preset | total | active/token | shape |
+| preset | total (v3) | active/token | v3 additions |
 |---|---|---|---|
-| s1 | 19.9B | 3.3B | d=2048, 7 stages × 6 branches, 128 experts |
-| s2 | 90.6B | 8.9B | d=2560, 6 × 9, 160 experts |
-| s3 | 117.9B | 18.8B | d=4096 — wider per token, not deeper |
-| s4 | 219.2B | 39.6B | d=5120, 12 × 8, 96 experts |
-| s5 | 414.9B | 61.6B | d=6144, 9 × 11, 32 wide experts |
+| s1 | 20.0B | 3.5B | +101M critics, +19M noting |
+| s2 | 90.7B | 9.0B | critics scale with stage widths |
+| s3 | 118.4B | 19.4B | wider-per-token, not deeper |
+| s4 | 219.3B | 40.9B | |
+| s5 | 415.0B | 61.9B | |
 
-All presets are counter-verified against the v2 architecture; treat them as
-starting points and retune in the panel.
+Working-expert sizes are the v2 ladder; v3 critics + noting experts add
+their counter-verified parameters on top (`report()` splits them out).
+Critics cost ~0.5% of total parameters. All presets are counter-verified;
+treat them as starting points and retune in the panel.
 
 ## Training scripts
 
+- `examples/v3_quickstart.py` — every v3 feature in one tiny CPU run:
+  counter verification, ACT halting, thinking modes, self-training,
+  encoderless VL + VaWU, native actuation.
 - `examples/train_rhododendron_lite.py` — full training run for
-  **rhododendron-lite (20B-A3.5B, blind)**: HF streaming data (no full
-  download), Muon + WSD, bf16/fp8 flags, gradient checkpointing,
-  periodic checkpoints, resume, FSDP/DDP via torchrun, optional push to the
-  GeoThinkAI org. `--smoke` runs a tiny local sanity pass with no downloads.
+  **rhododendron-lite (20B-A3.5B, blind)**: HF streaming data, Muon + WSD,
+  bf16/fp8 flags, gradient checkpointing, periodic checkpoints, resume,
+  FSDP/DDP via torchrun, optional push to the GeoThinkAI org.
+
+See **R-Build-V3-DESIGN.md** for the architecture blueprint.
 
 Apache-2.0. Part of the GeoThinkAI R-Build project.
