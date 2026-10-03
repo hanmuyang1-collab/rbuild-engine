@@ -67,6 +67,19 @@ pip install .[notebook]             # + ipywidgets for the interactive panel
 pip install .[train]                # + transformers/datasets for the training script
 ```
 
+## The interactive trainer (start here)
+
+```bash
+python examples/train_interactive.py
+```
+
+A ten-step guided tutorial: preset ladder → critics (X/Y, loop cap) →
+self-training → thinking mode → vision → actuation → training knobs →
+data (toy / local text / HF streaming) → review → train → save + optional
+HF push. Every question has a recommended default (Enter accepts), every
+answer is validated. No prompts wanted? Edit the `ANSWERS` dict at the top
+of the script — or set `AUTO = True` to run hands-free.
+
 ## Use it — everything is modifiable
 
 ```python
@@ -155,6 +168,9 @@ treat them as starting points and retune in the panel.
 
 ## Training scripts
 
+- `examples/train_interactive.py` — **the tutorial trainer**: ten guided,
+  numbered steps with validated inputs and recommended defaults; editable
+  `ANSWERS` dict + `AUTO` mode for hands-free runs.
 - `examples/v3_quickstart.py` — every v3 feature in one tiny CPU run:
   counter verification, ACT halting, thinking modes, self-training,
   encoderless VL + VaWU, native actuation.
