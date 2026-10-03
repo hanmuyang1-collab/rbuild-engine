@@ -36,8 +36,8 @@ model click natively.
 
 from .config import (RBuildConfig, ModelConfig, CacheLoopConfig,
                      ParallelConfig, CriticConfig, NotingConfig,
-                     ThinkingConfig, ActuationConfig, MemoryConfig,
-                     VisionConfig, TrainConfig, preset)
+                     ThinkingConfig, ActuationConfig, WatermarkConfig,
+                     MemoryConfig, VisionConfig, TrainConfig, preset)
 from .model import RBuildModel, CacheLoopLine, ParallelBundleStage
 from .memory import FastWeightMemory
 from .vision import VisionTower, VaWUPooler
@@ -45,6 +45,7 @@ from .critics import CriticExpert, CriticPanel, ACTHalting
 from .noting import NotingExperts, VerifiedNoteBuffer, SelfLearner
 from .thinking import ThinkingModes
 from .actuation import ActionCodec, ActuationHead, Action
+from .watermark import GreenListWatermark, WatermarkDetector
 from .optim import Muon, WSDScheduler, build_optimizer
 from .train import Trainer
 from . import interactive
@@ -54,11 +55,12 @@ __version__ = "3.0.0"
 __all__ = [
     "RBuildConfig", "ModelConfig", "CacheLoopConfig", "ParallelConfig",
     "CriticConfig", "NotingConfig", "ThinkingConfig", "ActuationConfig",
-    "MemoryConfig", "VisionConfig", "TrainConfig", "preset",
+    "WatermarkConfig", "MemoryConfig", "VisionConfig", "TrainConfig", "preset",
     "RBuildModel", "CacheLoopLine", "ParallelBundleStage",
     "FastWeightMemory", "VisionTower", "VaWUPooler",
     "CriticExpert", "CriticPanel", "ACTHalting",
     "NotingExperts", "VerifiedNoteBuffer", "SelfLearner",
     "ThinkingModes", "ActionCodec", "ActuationHead", "Action",
+    "GreenListWatermark", "WatermarkDetector",
     "Muon", "WSDScheduler", "build_optimizer", "Trainer", "interactive",
 ]

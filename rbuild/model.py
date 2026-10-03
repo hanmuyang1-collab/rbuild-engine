@@ -124,7 +124,7 @@ class CacheLoopLine(nn.Module):
             # each loop iteration gets its own copy of the line
             self.line = None
             self.loop_line = nn.ModuleList(
-                nn.ModuleList(Block(cfg, ffn_kind="dense") for _ in range(cl.n_layers))
+                nn.ModuleList(Block(cfg, ffn_kind="dense") for _ in range(cl.n_loops))
                 for _ in range(cl.n_loops)
             )
         self.mod = MoDRouter(cfg.model.d_model, cl.mod_capacity) if cl.use_mod_routing else None
@@ -297,6 +297,7 @@ class RBuildModel(nn.Module):
         self._runtime_sampling: Optional[dict] = None
         self._runtime_self_observe: bool = cfg.noting.enabled
         self._active_thinking_mode: Optional[str] = None
+        self._watermarker_obj = None
         self.thinking_mode = ThinkingModes(self)
         if cfg.critic.enabled and cfg.thinking.default_mode:
             try:
@@ -464,21 +465,34 @@ class RBuildModel(nn.Module):
         self.memory._fact_log.append({"n_tokens": int(ids.numel())})
 
     # ------------------------------------------------------------------ #
+    def _watermarker(self):
+        """Lazily built green-list watermarker (param-free)."""
+        if self._watermarker_obj is None:
+            from .watermark import GreenListWatermark
+            self._watermarker_obj = GreenListWatermark(
+                self.cfg.watermark, self.cfg.effective_vocab_size())
+        return self._watermarker_obj
+
+    # ------------------------------------------------------------------ #
     @torch.no_grad()
     def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 64,
                  temperature: Optional[float] = None, top_p: Optional[float] = None,
                  top_k: int = 0, eos_id: Optional[int] = None,
-                 images: Optional[torch.Tensor] = None) -> torch.Tensor:
+                 images: Optional[torch.Tensor] = None,
+                 watermark: Optional[bool] = None) -> torch.Tensor:
         # thinking modes set the sampling defaults
         rt = self._runtime_sampling or {}
         temperature = temperature if temperature is not None else rt.get("temperature", 1.0)
         top_p = top_p if top_p is not None else rt.get("top_p", 0.9)
+        wm = self.cfg.watermark.enabled if watermark is None else watermark
         self.eval()
         out = input_ids
         for _ in range(max_new_tokens):
             window = out[:, -self.cfg.model.max_seq_len:]
             logits, _ = self(window, images=images)
             nxt_logits = logits[:, -1, :].float() / max(1e-6, temperature)
+            if wm:                                            # v3: watermark bias
+                nxt_logits = self._watermarker().bias_logits(nxt_logits, out[:, -1])
             if top_k > 0:
                 v, _ = torch.topk(nxt_logits, min(top_k, nxt_logits.shape[-1]))
                 nxt_logits[nxt_logits < v[:, [-1]]] = -float("inf")

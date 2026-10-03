@@ -9,9 +9,9 @@ Without widgets (plain terminal / scripts):
     ui = interactive.launch()          # automatically falls back to prompts
 
 Every field of every config section — including the v3 sections (critic,
-noting, thinking, actuation) — is exposed. Changing a value re-runs
-validation + the parameter counter + the naive-vs-optimized cost report
-live. The panel can then build the model in one click.
+noting, thinking, actuation, watermark) — is exposed. Changing a value
+re-runs validation + the parameter counter + the naive-vs-optimized cost
+report live. The panel can then build the model in one click.
 
 Also included: `chat(...)` — an interactive generation session where the
 user can tweak sampling values, switch thinking modes, write facts into
@@ -28,7 +28,7 @@ import torch
 from .config import RBuildConfig, preset
 
 _SECTIONS = ("model", "cache_loop", "parallel", "critic", "noting",
-             "thinking", "actuation", "memory", "vision", "train")
+             "thinking", "actuation", "watermark", "memory", "vision", "train")
 
 
 # --------------------------------------------------------------------------- #
@@ -246,6 +246,8 @@ def chat(model, encode, decode, max_new_tokens: int = 64) -> None:
       /remember ...  write text into fast-weight memory (no training)
       /forget        reset the fast-weight memory
       /selfstats     critic-verified self-learning stats
+      /watermark on|off      toggle generation watermarking
+      /detect <text>         z-test text for your watermark
       /config        show the live config report
       /quit          exit
     Anything else is encoded, run through the extraction loop and
@@ -287,6 +289,14 @@ def chat(model, encode, decode, max_new_tokens: int = 64) -> None:
                 print("  [cache] memory reset")
             elif cmd == "/selfstats":
                 print(f"  [self-learn] {model.self_learn_stats()}")
+            elif cmd == "/watermark":
+                model.cfg.watermark.enabled = arg.lower() in ("on", "1", "true", "y")
+                print(f"  [watermark] {'on' if model.cfg.watermark.enabled else 'off'}")
+            elif cmd == "/detect":
+                from .watermark import WatermarkDetector
+                det = WatermarkDetector(model.cfg.watermark,
+                                        model.cfg.effective_vocab_size())
+                print(f"  [watermark] {det.detect(encode(arg).view(-1))}")
             elif cmd == "/config":
                 print(model.cfg.report())
             else:
