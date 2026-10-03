@@ -1,28 +1,49 @@
 """
-R-Build v2 architecture.
+R-Build v3 architecture.
 
-Stage A — CacheLoopLine ("the first set of layers in a single line, loops to
-pull cache"):
-    A single line of blocks. The hidden state runs through the line
-    `n_loops` times; on every `memory_read_every`-th pass the line performs
-    a delta-rule read against the fast-weight cache and injects the
-    retrieved value through a learned gate. This is the stage that *pulls*
-    the cache into the representation.
+v2 gave us the two-stage skeleton:
+  Stage A — CacheLoopLine: a single line of blocks, looped, pulling the
+            fast-weight cache each pass.
+  Stage B — ParallelBundleStage: parallel branches whose outputs bundle
+            and push to the next stage.
 
-Stage B — ParallelBundleStage ("the multiple parallel layers ... generate
-tokens and bundle to push to the next set of parallel layers"):
-    `n_branches` parallel branches all consume the same input. Their outputs
-    are bundled — learned gate, mean, or concat+project — and the bundle is
-    pushed to the next parallel stage. During token generation the final
-    bundle is what produces logits.
+v3 makes the skeleton *self-governing*:
 
-v2.1: vision soft tokens splice into the stream before the cache loop
-(`images=` argument), with loss automatically masked at vision positions.
+  1. Critic-gated extraction (ACT-style halting). The cache loop becomes
+     the *extraction loop*: after each iteration a panel of X parallel
+     critic experts scores every token; tokens halt as their cumulative
+     satisfaction crosses 1 (ACT), and the loop early-exits once Y critics
+     are satisfied on average. A ponder cost (loops + remainders) joins
+     the training loss.
+
+  2. Critic experts on the generative layers. Every parallel stage carries
+     X critics with MORE capacity than its working experts. They judge the
+     bundle and are the verifiers of the self-training pipeline.
+
+  3. Noting experts + non-separate self-training. Note-takers watch the
+     final hidden states during normal use (including generation), critics
+     verify, verified notes enter fast-weight memory gradient-free AND queue
+     in a low-RAM CPU buffer for consolidation into the slow weights.
+     Running and learning are the same pass.
+
+  4. Thinking modes: `model.thinking_mode.<mode>(<value>)` retunes loops,
+     Y-critics, thresholds and sampling live; users mint their own modes.
+
+  5. Native actuation (optional): reserved action tokens + a dedicated head
+     — the model clicks/scrolls/types by generating a token.
+
+  6. Vision (optional): v2.1 ViT mode, or v3 encoderless mode (no vision
+     encoder — patches are projected straight into d_model), with optional
+     VaWU whole-video summary tokens.
+
+Everything v3 can be switched off in the config; with critic/noting/
+actuation/vision disabled the architecture is bit-identical to v2.
 """
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from types import SimpleNamespace
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -34,6 +55,10 @@ from .layers.attention import CausalAttention, MoDRouter, RMSNorm
 from .layers.moe import build_ffn
 from .memory import FastWeightMemory
 from .vision import VisionTower
+from .critics import CriticPanel, ACTHalting
+from .noting import NotingExperts, SelfLearner
+from .thinking import ThinkingModes
+from .actuation import ActionCodec, ActuationHead
 
 
 # --------------------------------------------------------------------------- #
@@ -80,7 +105,7 @@ class _TokenSubsetBlock(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# Stage A — the cache-pulling loop
+# Stage A — the extraction loop (cache-pulling, critic-gated in v3)
 # --------------------------------------------------------------------------- #
 
 class CacheLoopLine(nn.Module):
@@ -107,6 +132,11 @@ class CacheLoopLine(nn.Module):
         self.mem_key_proj = nn.Linear(cfg.model.d_model, cfg.memory.key_dim, bias=False)
         self.read_gate = nn.Parameter(torch.full((cfg.model.d_model,), cfg.memory.read_gate_init))
         self.read_norm = RMSNorm(cfg.model.d_model, cfg.model.rmsnorm_eps)
+        # v3: critic panel gating the loop (ACT-style halting)
+        c = cfg.critic
+        self.critics = CriticPanel(cfg.model.d_model, cfg.resolved_critic_hidden(),
+                                   c.n_critics, c.threshold) if c.enabled else None
+        self.last_halting: Optional[dict] = None
 
     def _pull_cache(self, x: torch.Tensor, memory: FastWeightMemory) -> torch.Tensor:
         """Delta-rule read against the fast-weight cache, gated injection."""
@@ -114,21 +144,56 @@ class CacheLoopLine(nn.Module):
         retrieved = memory.read(keys)                    # (B, T, vd==d_model)
         return x + torch.tanh(self.read_gate) * retrieved
 
-    def forward(self, x: torch.Tensor, memory: FastWeightMemory) -> torch.Tensor:
-        for loop in range(self.n_loops):
-            blocks = self.line if self.line is not None else self.loop_line[loop]
-            for blk in blocks:
-                if self.mod is not None:
-                    x = self.mod(x, _TokenSubsetBlock(blk))
-                else:
-                    x, _ = blk(x)
-            if (loop + 1) % self.read_every == 0:
-                x = self._pull_cache(self.read_norm(x), memory)
+    def _run_blocks(self, x: torch.Tensor, loop: int) -> torch.Tensor:
+        blocks = self.line if self.line is not None else self.loop_line[loop]
+        for blk in blocks:
+            if self.mod is not None:
+                x = self.mod(x, _TokenSubsetBlock(blk))
+            else:
+                x, _ = blk(x)
         return x
+
+    def forward(self, x: torch.Tensor, memory: Optional[FastWeightMemory],
+                max_loops: Optional[int] = None,
+                y_critics: Optional[int] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Returns (hidden, ponder_cost_or_None). With critics enabled the loop
+        is adaptive; without them it runs exactly n_loops iterations (v2).
+        """
+        if self.critics is None:
+            n = self.n_loops
+            for loop in range(n):
+                x = self._run_blocks(x, loop % self.n_loops)
+                if memory is not None and (loop + 1) % self.read_every == 0:
+                    x = self._pull_cache(self.read_norm(x), memory)
+            self.last_halting = None
+            return x, None
+
+        # ---- v3: ACT-style critic-gated extraction ----
+        c = self.cfg.critic
+        cap = max_loops or c.max_loops
+        halt = ACTHalting(c, x.shape[0], x.shape[1], x.device,
+                          max_loops=cap, y_critics=y_critics)
+        frozen = x
+        prev_running = halt.running.clone()
+        for loop in range(cap):
+            x_new = self._run_blocks(x, loop % self.n_loops)
+            if memory is not None and (loop + 1) % self.read_every == 0:
+                x_new = self._pull_cache(self.read_norm(x_new), memory)
+            done = halt.step(x_new, self.critics)
+            # halted tokens keep their final state; running tokens continue
+            just_halted = prev_running & ~halt.running
+            frozen = torch.where(just_halted.unsqueeze(-1), x_new, frozen)
+            x = torch.where(halt.running.unsqueeze(-1), x_new, frozen)
+            prev_running = halt.running.clone()
+            if done:
+                break
+        self.last_halting = halt.stats()
+        return x, halt.ponder_cost()
 
 
 # --------------------------------------------------------------------------- #
-# Stage B — parallel bundle stages
+# Stage B — parallel generative stages (with critic panels in v3)
 # --------------------------------------------------------------------------- #
 
 class ParallelBundleStage(nn.Module):
@@ -145,6 +210,11 @@ class ParallelBundleStage(nn.Module):
         elif p.bundle_mode == "concat":
             self.proj = nn.Linear(p.n_branches * d, d, bias=False)
         self.out_norm = RMSNorm(d, cfg.model.rmsnorm_eps)
+        # v3: X parallel critic experts, wider than the working experts
+        c = cfg.critic
+        self.critics = CriticPanel(d, cfg.resolved_critic_hidden(),
+                                   c.n_critics, c.threshold) \
+            if (c.enabled and c.stage_critics) else None
 
     def _bundle(self, outs: List[torch.Tensor], x: torch.Tensor) -> torch.Tensor:
         if self.bundle_mode == "gate":
@@ -164,6 +234,11 @@ class ParallelBundleStage(nn.Module):
                 outs.append(branch(x)[0])
         return x + self.out_norm(self._bundle(outs, x))
 
+    def critic_verdict(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """(satisfaction, n_satisfied) of this stage's critics on x."""
+        assert self.critics is not None, "stage critics disabled"
+        return self.critics(x)
+
 
 # --------------------------------------------------------------------------- #
 # the model
@@ -175,12 +250,13 @@ class RBuildModel(nn.Module):
         cfg.validate()
         self.cfg = cfg
         m = cfg.model
-        self.embed = nn.Embedding(m.vocab_size, m.d_model)
+        eff_vocab = cfg.effective_vocab_size()
+        self.embed = nn.Embedding(eff_vocab, m.d_model)
         self.cache_loop = CacheLoopLine(cfg)
         self.stages = nn.ModuleList(ParallelBundleStage(cfg)
                                     for _ in range(cfg.parallel.n_stages))
         self.final_norm = RMSNorm(m.d_model, m.rmsnorm_eps)
-        self.lm_head = nn.Linear(m.d_model, m.vocab_size, bias=False)
+        self.lm_head = nn.Linear(m.d_model, eff_vocab, bias=False)
         if m.tie_embeddings:
             self.lm_head.weight = self.embed.weight
 
@@ -193,12 +269,40 @@ class RBuildModel(nn.Module):
 
         self.drop = nn.Dropout(m.dropout)
 
-        # vision tower (v2.1) — not built at all in blind mode
+        # vision tower — not built at all in blind mode
         self.vision = VisionTower(cfg) if cfg.vision.enabled else None
         if self.vision is not None and cfg.vision.freeze_vision:
             for name, p_ in self.vision.named_parameters():
                 if "projector" not in name:
                     p_.requires_grad = False
+
+        # v3: noting experts + non-separate self-learner
+        self.noting_experts = NotingExperts(m.d_model, cfg.memory.key_dim,
+                                            cfg.memory.value_dim,
+                                            cfg.noting.n_noting_experts,
+                                            cfg.resolved_note_hidden()) \
+            if cfg.noting.enabled else None
+        self.self_learner = SelfLearner(self) if cfg.noting.enabled else None
+
+        # v3: native actuation — action codec + dedicated action head
+        self.action_codec = ActionCodec(m.vocab_size, cfg.actuation.screen_grid,
+                                        cfg.actuation.scroll_steps) \
+            if cfg.actuation.enabled else None
+        self.action_head = ActuationHead(m.d_model, cfg.n_action_tokens()) \
+            if cfg.actuation.enabled else None
+
+        # v3: runtime knobs driven by thinking modes
+        self._runtime_max_loops: Optional[int] = None
+        self._runtime_y_critics: Optional[int] = None
+        self._runtime_sampling: Optional[dict] = None
+        self._runtime_self_observe: bool = cfg.noting.enabled
+        self._active_thinking_mode: Optional[str] = None
+        self.thinking_mode = ThinkingModes(self)
+        if cfg.critic.enabled and cfg.thinking.default_mode:
+            try:
+                self.thinking_mode.apply(cfg.thinking.default_mode)
+            except KeyError:
+                pass
 
         self.apply(self._init)
 
@@ -213,11 +317,12 @@ class RBuildModel(nn.Module):
     def _splice_vision(self, input_ids: torch.Tensor,
                        images: Optional[torch.Tensor]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Replace `<image>` placeholder embeddings with vision-tower soft tokens.
+        Replace `<image>` placeholder embeddings with vision soft tokens
+        (ViT or encoderless mode; VaWU whole-video tokens included).
         Returns (inputs_embeds, image_mask) — mask marks vision positions so
         the loss can skip them.
         """
-        emb = self.embed(input_ids)
+        emb = self.embed(input_ids.clamp_max(self.embed.num_embeddings - 1))
         if self.vision is None:
             return emb, None
         if images is None:
@@ -232,7 +337,9 @@ class RBuildModel(nn.Module):
         if not (counts == K).all():
             raise ValueError(
                 f"each sample needs exactly {K} image placeholders "
-                f"(got {counts.tolist()}); one placeholder per vision soft token")
+                f"(got {counts.tolist()}); one placeholder per vision soft token"
+                + (f" (note: VaWU adds {self.cfg.vision.vawu_tokens} whole-video tokens)"
+                   if (self.cfg.vision.vawu and images.shape[1] > 1) else ""))
         emb = emb.clone()
         emb[mask] = img_tokens.reshape(-1, D).to(emb.dtype)
         return emb, mask
@@ -246,28 +353,48 @@ class RBuildModel(nn.Module):
         return blk(x)[0]
 
     # ------------------------------------------------------------------ #
+    def critics_verify(self, hidden: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        The generative critics' verdict on a hidden state — used by the
+        self-learner to approve/reject notes. Uses the final stage's panel
+        (falls back to the extraction-loop panel; without any critics,
+        everything passes with a neutral verdict).
+        """
+        for stage in reversed(self.stages):
+            if stage.critics is not None:
+                return stage.critic_verdict(hidden)
+        if self.cache_loop.critics is not None:
+            return self.cache_loop.critics(hidden)
+        ones = torch.ones(hidden.shape[:2], device=hidden.device)
+        return ones, ones.to(torch.long) * 10**6
+
+    # ------------------------------------------------------------------ #
     def forward(self, input_ids: torch.Tensor,
                 targets: Optional[torch.Tensor] = None,
                 images: Optional[torch.Tensor] = None,
                 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x, image_mask = self._splice_vision(input_ids, images)
         x = self.drop(x)
-        if self.memory is not None:
-            x = self.cache_loop(x, self.memory)
-        else:
-            # memory off: loop still runs, pulls are skipped
-            for loop in range(self.cache_loop.n_loops):
-                blocks = self.cache_loop.line if self.cache_loop.line is not None \
-                    else self.cache_loop.loop_line[loop]
-                for blk in blocks:
-                    x = self._run_block(blk, x)
+        x, ponder = self.cache_loop(x, self.memory,
+                                    max_loops=self._runtime_max_loops,
+                                    y_critics=self._runtime_y_critics)
         for stage in self.stages:
             if self.training and self.cfg.train.grad_checkpoint and torch.is_grad_enabled():
                 x = torch.utils.checkpoint.checkpoint(stage, x, use_reentrant=False)
             else:
                 x = stage(x)
         x = self.final_norm(x)
+
+        # v3: non-separate self-training — note + verify + learn while running
+        if (self.self_learner is not None and self._runtime_self_observe
+                and (not self.training or self.cfg.noting.observe_in_training)):
+            self._self_observe(x)
+
         logits = self.lm_head(x)
+        # v3: action columns come from the dedicated actuation head
+        if self.action_head is not None:
+            n_text = self.cfg.model.vocab_size
+            logits = torch.cat([logits[..., :n_text], self.action_head(x)], dim=-1)
 
         loss = None
         if targets is not None:
@@ -275,22 +402,39 @@ class RBuildModel(nn.Module):
                 targets = targets.masked_fill(image_mask, -100)   # never predict vision positions
             loss = self._chunked_ce(logits, targets)
             loss = loss + 0.01 * self._moe_aux_loss()
+            if ponder is not None:                                # v3: ACT halting loss
+                loss = loss + self.cfg.critic.halt_loss_weight * ponder
         return logits, loss
+
+    # ------------------------------------------------------------------ #
+    @torch.no_grad()
+    def _self_observe(self, hidden: torch.Tensor) -> int:
+        """Note-taking + critic verification on a finished forward pass."""
+        if self.self_learner is None:
+            return 0
+        return self.self_learner.observe(hidden)
+
+    def self_learn_stats(self) -> dict:
+        if self.self_learner is None:
+            return {"enabled": False}
+        return {"enabled": True, **self.self_learner.stats()}
 
     # ------------------------------------------------------------------ #
     def _chunked_ce(self, logits, targets):
         """Chunked cross-entropy over the token axis (memory saver)."""
         B, T, V = logits.shape
         if not (self.cfg.train.chunked_ce and self.training):
-            return F.cross_entropy(logits.reshape(-1, V).float(), targets.reshape(-1))
+            return F.cross_entropy(logits.reshape(-1, V).float(), targets.reshape(-1),
+                                   ignore_index=-100)
         chunk = max(1, self.cfg.train.ce_chunk_tokens)
         flat_l = logits.reshape(-1, V)
         flat_t = targets.reshape(-1)
         total, count = 0.0, 0
         for i in range(0, flat_l.shape[0], chunk):
-            ls = F.cross_entropy(flat_l[i:i + chunk].float(), flat_t[i:i + chunk], reduction="sum")
+            ls = F.cross_entropy(flat_l[i:i + chunk].float(), flat_t[i:i + chunk],
+                                 reduction="sum", ignore_index=-100)
             total = total + ls
-            count += int((flat_t[i:i + chunk] != -100).sum())   # skip ignored (vision) positions
+            count += int((flat_t[i:i + chunk] != -100).sum())   # skip ignored positions
         return total / max(1, count)
 
     def _moe_aux_loss(self):
@@ -322,9 +466,13 @@ class RBuildModel(nn.Module):
     # ------------------------------------------------------------------ #
     @torch.no_grad()
     def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 64,
-                 temperature: float = 1.0, top_p: float = 0.9,
+                 temperature: Optional[float] = None, top_p: Optional[float] = None,
                  top_k: int = 0, eos_id: Optional[int] = None,
                  images: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # thinking modes set the sampling defaults
+        rt = self._runtime_sampling or {}
+        temperature = temperature if temperature is not None else rt.get("temperature", 1.0)
+        top_p = top_p if top_p is not None else rt.get("top_p", 0.9)
         self.eval()
         out = input_ids
         for _ in range(max_new_tokens):
