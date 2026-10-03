@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rbuild-engine"
-version = "2.1.0"
-description = "R-Build: a fully user-modifiable open-source LLM architecture and training-speed engine with VL support. Cache-loop sequential stages + parallel bundle stages, MoD routing, fine-grained MoE with shared expert, Muon optimizer, WSD schedule, chunked cross-entropy, gradient-free fast-weight memory, ViT vision tower."
+version = "3.0.0"
+description = "R-Build v3: a fully user-modifiable open-source LLM architecture and training-speed engine. Critic-gated ACT-style adaptive extraction, critic experts on generative stages, critic-verified non-separate self-training (learn while running), thinking modes, encoderless VL with whole-video understanding, native action tokens, MoD routing, fine-grained MoE with shared expert, Muon optimizer, WSD schedule, chunked cross-entropy, gradient-free fast-weight memory."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "Apache-2.0"
 authors = [{ name = "GeoThinkAI" }]
-keywords = ["llm", "vlm", "moe", "muon", "fast-weight-memory", "training", "architecture"]
+keywords = ["llm", "vlm", "moe", "muon", "fast-weight-memory", "act-halting", "critic-experts", "self-training", "agentic", "training", "architecture"]
 dependencies = [
     "torch>=2.0",
 ]

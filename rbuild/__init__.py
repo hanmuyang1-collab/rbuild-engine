@@ -1,43 +1,64 @@
 """
-R-Build v2.1 — a fully user-modifiable, open-source LLM architecture and
-training-speed engine, now with complete VL support.
+R-Build v3 — a fully user-modifiable, open-source LLM architecture and
+training-speed engine: critic-gated adaptive extraction, critic-verified
+non-separate self-training, thinking modes, encoderless VL/VaWU, and
+native actuation.
 
 Quick start
 -----------
 >>> from rbuild import RBuildConfig, RBuildModel, Trainer, preset
 >>> cfg = preset("s1")                    # or RBuildConfig() and edit anything
->>> cfg.parallel.n_branches = 8           # every value is modifiable
->>> cfg.vision.enabled = True             # v2.1: add the ViT tower (blind if False)
+>>> cfg.critic.n_critics = 8              # every value is modifiable
+>>> cfg.vision.enabled = True             # add vision (vit or encoderless)
 >>> print(cfg.report())                   # params + naive-vs-optimized cost
 >>> model = RBuildModel(cfg)
+
+v3 in one tour:
+>>> model.thinking_mode.deep()            # ACT loops deepen, critics stricter
+>>> model.thinking_mode.create("exam", max_loops=10, y_critics=3)
+>>> model.thinking_mode.exam()            # your mode is now native
+>>> out = model.generate(ids)             # noting experts observe, critics verify,
+>>> model.self_learn_stats()              # verified notes already in memory
+>>> trainer.self_train_step()             # consolidate notes into slow weights
 
 Interactive (Colab / Jupyter):
 >>> from rbuild import interactive
 >>> ui = interactive.launch()             # widget panel for every value
 >>> model = ui.model                      # after clicking "Build model"
 
-Architecture: a single-line cache-loop stage (loops to pull the fast-weight
-delta-rule cache) feeds stacked parallel-bundle stages whose branches bundle
-their outputs and push them onward. Images/video enter as soft tokens spliced
-at placeholder positions, so both stages stay modality-agnostic.
+Architecture: a single-line extraction loop (critic-gated, ACT-halted,
+pulling the fast-weight delta-rule cache) feeds stacked parallel-bundle
+generative stages, each watched by X critic experts with more capacity
+than the working experts. Images/video enter as soft tokens (ViT tower or
+encoderless, optional VaWU whole-video tokens); action tokens let the
+model click natively.
 """
 
 from .config import (RBuildConfig, ModelConfig, CacheLoopConfig,
-                     ParallelConfig, MemoryConfig, VisionConfig,
-                     TrainConfig, preset)
+                     ParallelConfig, CriticConfig, NotingConfig,
+                     ThinkingConfig, ActuationConfig, MemoryConfig,
+                     VisionConfig, TrainConfig, preset)
 from .model import RBuildModel, CacheLoopLine, ParallelBundleStage
 from .memory import FastWeightMemory
-from .vision import VisionTower
+from .vision import VisionTower, VaWUPooler
+from .critics import CriticExpert, CriticPanel, ACTHalting
+from .noting import NotingExperts, VerifiedNoteBuffer, SelfLearner
+from .thinking import ThinkingModes
+from .actuation import ActionCodec, ActuationHead, Action
 from .optim import Muon, WSDScheduler, build_optimizer
 from .train import Trainer
 from . import interactive
 
-__version__ = "2.1.0"
+__version__ = "3.0.0"
 
 __all__ = [
     "RBuildConfig", "ModelConfig", "CacheLoopConfig", "ParallelConfig",
+    "CriticConfig", "NotingConfig", "ThinkingConfig", "ActuationConfig",
     "MemoryConfig", "VisionConfig", "TrainConfig", "preset",
     "RBuildModel", "CacheLoopLine", "ParallelBundleStage",
-    "FastWeightMemory", "VisionTower", "Muon", "WSDScheduler",
-    "build_optimizer", "Trainer", "interactive",
+    "FastWeightMemory", "VisionTower", "VaWUPooler",
+    "CriticExpert", "CriticPanel", "ACTHalting",
+    "NotingExperts", "VerifiedNoteBuffer", "SelfLearner",
+    "ThinkingModes", "ActionCodec", "ActuationHead", "Action",
+    "Muon", "WSDScheduler", "build_optimizer", "Trainer", "interactive",
 ]
