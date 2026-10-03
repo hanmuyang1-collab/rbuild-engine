@@ -21,6 +21,7 @@ Sections:
                      self-training (learn while running, low RAM)
   ThinkingConfig   — v3: default thinking mode + user-created modes
   ActuationConfig  — v3: native action tokens (the model clicks by itself)
+  WatermarkConfig  — v3: green-list generation watermarking (zero params)
   MemoryConfig     — the gradient-free fast-weight delta-rule memory
   VisionConfig     — ViT tower *or* encoderless vision, plus VaWU whole-video
                      summary tokens (blind by default)
@@ -197,6 +198,24 @@ class ActuationConfig:
 
 
 @dataclass
+class WatermarkConfig:
+    """
+    v3 — generation watermarking (green-list logit biasing).
+
+    While sampling, the previous token is hashed with `key` to seed a split
+    of the vocabulary into a green list (fraction `gamma`); green logits are
+    boosted by `delta`. Text generated this way is provably yours: anyone
+    with the key replays the split and runs a z-test (WatermarkDetector).
+    Pure sampling-time signal — zero parameters, checkpoints unaffected.
+    """
+    enabled: bool = False
+    key: str = "rbuild-v3"           # secret — keep it private
+    delta: float = 2.0               # green-list logit boost
+    gamma: float = 0.25              # green-list fraction of the vocab
+    z_threshold: float = 4.0         # z-score needed to call "watermarked"
+
+
+@dataclass
 class MemoryConfig:
     """
     Fast-weight memory: a delta-rule key->value matrix written *without
@@ -292,6 +311,7 @@ class RBuildConfig:
     noting: NotingConfig = field(default_factory=NotingConfig)
     thinking: ThinkingConfig = field(default_factory=ThinkingConfig)
     actuation: ActuationConfig = field(default_factory=ActuationConfig)
+    watermark: WatermarkConfig = field(default_factory=WatermarkConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
@@ -358,6 +378,10 @@ class RBuildConfig:
         # v3: actuation
         if a.enabled:
             assert a.screen_grid >= 4 and a.scroll_steps >= 1
+        # v3: watermark
+        w = self.watermark
+        if w.enabled:
+            assert w.delta > 0 and 0.0 < w.gamma < 1.0 and w.z_threshold > 0
         v = self.vision
         if v.enabled:
             assert v.image_token_id is not None, \
@@ -582,6 +606,7 @@ class RBuildConfig:
             f"  thinking mode     : {self.thinking.default_mode}"
             + (f" (+{len(self.thinking.custom_modes)} custom)" if self.thinking.custom_modes else ""),
             f"  native actuation  : {act_line}",
+            f"  gen watermark     : {'off' if not self.watermark.enabled else f'on (delta={self.watermark.delta}, gamma={self.watermark.gamma})'}",
             f"  fast-weight memory: {'on' if self.memory.enabled else 'off'}"
             f" (key={self.memory.key_dim}, value={self.memory.value_dim})",
             f"  vision            : {vision_line}",
