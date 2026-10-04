@@ -88,7 +88,9 @@ class Trainer:
             save_every: int = 0, save_dir: Optional[str] = None) -> dict:
         """
         batches: iterable yielding (input_ids, targets) LongTensors of shape
-        (B, T). Re-loops the iterable if it is shorter than max_steps.
+        (B, T) — or (input_ids, targets, images) with images (B, N, C, H, W)
+        for vision training (see rbuild.data). Re-loops the iterable if it
+        is shorter than max_steps.
         save_every > 0 writes a checkpoint to save_dir every N steps.
         If train.self_train_every > 0, verified self-observed notes are
         consolidated into the slow weights every N steps.
@@ -100,15 +102,21 @@ class Trainer:
         data_iter = iter(batches)
         while step < max_steps:
             try:
-                x, y = next(data_iter)
+                batch = next(data_iter)
             except StopIteration:
                 data_iter = iter(batches)
-                x, y = next(data_iter)
+                batch = next(data_iter)
+            if len(batch) == 3:
+                x, y, images = batch
+                images = images.to(self.device)
+            else:
+                x, y = batch
+                images = None
             x, y = x.to(self.device), y.to(self.device)
 
             lr_f = self.sched.set(step)
             with _autocast_ctx(cfg.train.precision, self.device_type):
-                _, loss = self.model(x, targets=y)
+                _, loss = self.model(x, targets=y, images=images)
                 loss = loss / cfg.train.grad_accum
             loss.backward()
             accum += 1

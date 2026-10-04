@@ -51,6 +51,9 @@ from .thinking import ThinkingModes
 from .actuation import ActionCodec, ActuationHead, Action
 from .watermark import GreenListWatermark, WatermarkDetector
 from .optim import Muon, WSDScheduler, build_optimizer
+from .data import (load_manifest, manifest_batches, hf_image_batches,
+                   hf_video_batches, load_image, load_video,
+                   vision_tokens_per_sample)
 from .train import Trainer
 from . import interactive
 
@@ -67,4 +70,6 @@ __all__ = [
     "ThinkingModes", "ActionCodec", "ActuationHead", "Action",
     "GreenListWatermark", "WatermarkDetector",
     "Muon", "WSDScheduler", "build_optimizer", "Trainer", "interactive",
+    "load_manifest", "manifest_batches", "hf_image_batches",
+    "hf_video_batches", "load_image", "load_video", "vision_tokens_per_sample",
 ]
