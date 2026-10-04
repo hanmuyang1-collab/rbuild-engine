@@ -246,7 +246,8 @@ def chat(model, encode, decode, max_new_tokens: int = 64) -> None:
       /remember ...  write text into fast-weight memory (no training)
       /forget        reset the fast-weight memory
       /selfstats     critic-verified self-learning stats
-      /autotrain on|off      toggle self-training-while-running (default off)
+      /nsct on|off           toggle non-separate continuous training
+                             (self-training while running; default off)
       /watermark on|off      toggle generation watermarking
       /detect <text>         z-test text for your watermark
       /config        show the live config report
@@ -290,9 +291,9 @@ def chat(model, encode, decode, max_new_tokens: int = 64) -> None:
                 print("  [cache] memory reset")
             elif cmd == "/selfstats":
                 print(f"  [self-learn] {model.self_learn_stats()}")
-            elif cmd == "/autotrain":
-                model.set_auto_train(arg.lower() in ("on", "1", "true", "y"))
-                print(f"  [auto-train] {'on' if model.cfg.noting.auto_train else 'off'}")
+            elif cmd in ("/nsct", "/autotrain"):
+                model.set_nsct(arg.lower() in ("on", "1", "true", "y"))
+                print(f"  [NSCT] {'on' if model.cfg.noting.nsct else 'off'}")
             elif cmd == "/watermark":
                 model.cfg.watermark.enabled = arg.lower() in ("on", "1", "true", "y")
                 print(f"  [watermark] {'on' if model.cfg.watermark.enabled else 'off'}")

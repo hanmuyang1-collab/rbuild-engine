@@ -4,7 +4,8 @@ model_id is the path to a checkpoint directory written by
 ``Trainer.save_checkpoint`` (rbuild_config.json + model.pt + meta.json).
 Loading goes through ``Trainer.load_checkpoint``, so the full v3 feature
 set rides along: thinking modes, generation watermarking, fast-weight
-memory, and the auto-train toggle (off by default while serving).
+memory, and the NSCT toggle (non-separate continuous training — off by
+default while serving).
 
 Tokenization: byte-level UTF-8 by default — matches rbuild's local .txt
 training path (any vocab_size >= 256 works). Pass ``tokenizer="<hf-id>"``
