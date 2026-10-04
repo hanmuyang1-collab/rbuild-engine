@@ -42,9 +42,9 @@ tokens ─► embed ─► EXTRACTION LOOP ─► PARALLEL STAGE 1 ─► ... �
    immediately* (the model learns while running, ~zero extra RAM) and queued
    in a CPU fp16 buffer for `Trainer.self_train_step()` to consolidate into
    the slow weights. Running and learning are the same pass.
-   **v3.1: this is opt-in.** Self-training-while-running is OFF by default
-   (`noting.auto_train=False`) — turn it on per config, per call
-   (`model.set_auto_train(True)`), per chat command (`/autotrain on`), or
+   **v3.1: this is opt-in.** NSCT — non-separate continuous training —
+   is OFF by default (`noting.nsct=False`) — turn it on per config, per
+   call (`model.set_nsct(True)`), per chat command (`/nsct on`), or
    per thinking mode (`self_observe`).
 4. **Thinking-mode creator.** `model.thinking_mode.<mode>(<value>)` retunes
    loops, Y-critics, thresholds and sampling live — built-ins
@@ -111,17 +111,20 @@ model.thinking_mode.exam()                    # your mode is now native
 model.thinking_mode.list()                    # all modes + knobs
 ```
 
-### Self-training while running
+### Self-training while running (NSCT)
+
+NSCT = non-separate continuous training: running and learning are the same
+pass, no separate training phase. It is opt-in (off by default):
 
 ```python
-cfg.noting.auto_train = True        # OPT-IN: off by default
+cfg.noting.nsct = True              # OPT-IN: off by default
 model = RBuildModel(cfg)
 model.eval()
 out = model.generate(ids)           # noting experts observe this pass
 model.self_learn_stats()            # {'notes_verified': ..., 'accept_rate': ..., 'buffered': ...}
 
-model.set_auto_train(False)         # toggle at runtime — pure inference again
-model.set_auto_train(True)          # learn while running again
+model.set_nsct(False)               # toggle at runtime — pure inference again
+model.set_nsct(True)                # learn while running again
 
 trainer = Trainer(model, cfg)
 trainer.self_train_step()           # consolidate verified notes into slow weights
@@ -197,7 +200,7 @@ model = ui.model
 interactive.chat(model, encode, decode)
 # /mode deep      switch thinking mode live      /modes     list modes
 # /selfstats      self-learning counters         /remember  gradient-free fact write
-# /autotrain on   self-training while running (default off)
+# /nsct on        non-separate continuous training (default off)
 ```
 
 ## Stage ladder presets (continued-training path)

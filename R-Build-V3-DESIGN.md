@@ -100,10 +100,11 @@ forward pass (training OR generation — running is running)
 
 - **Fast path (parallel running and learning):** gradient-free delta-rule
   writes happen inside the observing forward pass itself.
-- **Opt-in gate (v3.1):** none of this runs unless you ask for it.
-  `noting.auto_train=False` (the default) means startup never self-trains —
+- **Opt-in gate (v3.1):** none of this runs unless you ask for it. NSCT
+  (non-separate continuous training) is controlled by `noting.nsct`;
+  `False` (the default) means startup never self-trains —
   pure inference, no notes taken, nothing written. Three ways to turn it
-  on: the config flag, `model.set_auto_train(True)` at runtime, or
+  on: the config flag, `model.set_nsct(True)` at runtime, or
   explicitly applying a thinking mode with `self_observe=True`. The gate is
   enforced *after* the default thinking mode is applied in `__init__`, so a
   mode's `self_observe` only counts when the mode was applied by the user,
@@ -211,10 +212,12 @@ naive-vs-optimized cost side by side. v3 overhead at s1: +101M critics,
 - The fast-weight memory matrix, checkpoint format, and
   `Trainer` save/load are unchanged.
 - v3.1 behavior note: weights and configs are fully compatible with v3.0,
-  but self-training-while-running now defaults to OFF
-  (`noting.auto_train=False`). A v3.0 run that silently learned during
-  generation stays purely inferential in v3.1 until you opt in — set
-  `noting.auto_train=True` to restore the old behavior exactly.
+  but NSCT now defaults to OFF (`noting.nsct=False`). A v3.0 run that
+  silently learned during generation stays purely inferential in v3.1
+  until you opt in — set `noting.nsct=True` to restore the old behavior
+  exactly. Old checkpoints/configs written with `auto_train` still load —
+  the key is a legacy alias for `nsct`, and `model.set_auto_train()` is a
+  legacy alias for `model.set_nsct()`.
 
 ## 10. Serving — R-Run, merged in (v3.1)
 
@@ -240,6 +243,6 @@ R-Build builds and trains the models, R-Run serves them.
   `/admin/swap` / `/admin/wipe` / `/admin/status`. CLI:
   `rrun serve <model> --backend rbuild`, `rrun swap <model>`,
   `rrun status`, `rrun wipe`.
-- Serving is pure inference by default — the auto-train gate (§3) applies
+- Serving is pure inference by default — the NSCT gate (§3) applies
   to served models too, so a resident model never self-trains unless the
   operator opts in.

@@ -41,7 +41,7 @@ ANSWERS = {
     "y_critics": None,            # Y critics needed to halt (int)
     "max_loops": None,            # extraction-loop cap (int)
     "noting": None,               # True/False (critic-verified self-training)
-    "auto_train": None,           # True/False (learn while running; default OFF)
+    "nsct": None,                 # True/False (non-separate continuous training; default OFF)
     "thinking_mode": None,        # "fast"|"balanced"|"deep"|"careful"|"research"|"custom"
     "vision": None,               # "blind" | "vit" | "encoderless"
     "vawu": None,                 # True/False (whole-video tokens)
@@ -194,8 +194,8 @@ def main():
     cfg.noting.enabled = cfg.critic.enabled and ask_bool(
         "noting", "enable self-training-while-running", True)
     if cfg.noting.enabled:
-        cfg.noting.auto_train = ask_bool(
-            "auto_train", "auto-train while running (learn during generation)", False,
+        cfg.noting.nsct = ask_bool(
+            "nsct", "non-separate continuous training (learn during generation)", False,
             hint="OFF by default — the model only self-trains when you opt in")
 
     # ---- 4. thinking mode --------------------------------------------- #
