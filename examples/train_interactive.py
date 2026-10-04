@@ -54,8 +54,10 @@ ANSWERS = {
     "watermark": None,            # True/False (green-list generation watermark)
     "watermark_key": None,        # secret key for the watermark
     "output_len": None,           # tokens to generate in the post-training demo
-    "data": None,                 # "toy" | "text" | "hf"
+    "data": None,                 # "toy" | "text" | "json" | "hf"
     "data_path": None,            # path for "text" (local .txt file)
+    "json_path": None,            # path for "json" (manifest: text + image/video links)
+    "hf_kind": None,              # for "hf": "text" | "image" | "video"
     "save_dir": None,             # checkpoint directory
     "hf_repo": None,              # e.g. "GeoThinkAI/R-build-20b-a3.4b" ("" = skip)
     "hf_token": None,             # "hf_..." token ("" = skip)  <-- PUT YOURS HERE
@@ -153,6 +155,19 @@ def hf_batches(tokenizer_name, dataset_name, vocab_size, batch, seq):
 # the tutorial
 # --------------------------------------------------------------------- #
 
+def _fit_seq_for_vision(cfg, n_frames: int = 8):
+    """Vision placeholders must fit in the context — bump seq if needed."""
+    if not cfg.vision.enabled:
+        return
+    from rbuild import vision_tokens_per_sample
+    n_frames = min(n_frames, cfg.vision.max_video_frames)
+    need = vision_tokens_per_sample(cfg, n_frames) + 32   # + room for text
+    if cfg.model.max_seq_len < need:
+        print(f"      note: context length {cfg.model.max_seq_len} can't hold "
+              f"{n_frames} frame(s) of vision tokens — raising to {need}")
+        cfg.model.max_seq_len = need
+
+
 def main():
     from rbuild import RBuildConfig, RBuildModel, Trainer, preset
 
@@ -215,6 +230,13 @@ def main():
         cfg.vision.mode = vmode
         cfg.vision.image_token_id = cfg.model.vocab_size - 1
         cfg.vision.vawu = ask_bool("vawu", "VaWU whole-video tokens", True)
+        if vmode == "vit":
+            vd = cfg.vision.vit_dim or cfg.model.d_model
+            if vd % cfg.vision.vit_heads != 0:
+                h = max(h for h in range(1, cfg.vision.vit_heads + 1) if vd % h == 0)
+                print(f"      note: vit_heads {cfg.vision.vit_heads} doesn't divide "
+                      f"vit_dim {vd} — using {h}")
+                cfg.vision.vit_heads = h
 
     # ---- 6. actuation -------------------------------------------------- #
     print("\nSTEP 6 — native actuation (model clicks by generating tokens)")
@@ -245,20 +267,57 @@ def main():
 
     # ---- 8. data -------------------------------------------------------- #
     print("\nSTEP 8 — data source")
-    data_kind = ask("data", "data", "toy", choices=["toy", "text", "hf"],
-                    hint="toy = random tokens, instant; text = local .txt; hf = streaming")
+    data_kind = ask("data", "data", "toy", choices=["toy", "text", "json", "hf"],
+                    hint="toy = random tokens, instant; text = local .txt; "
+                         "json = manual manifest (text + image/video links, any model type); "
+                         "hf = streaming")
     if data_kind == "text":
         path = ask("data_path", "path to .txt file", "data.txt")
         while not os.path.exists(path):
             path = ask("data_path", f"not found — path to .txt file", "data.txt")
         batches = text_batches(path, cfg.effective_vocab_size(),
                                cfg.train.batch_size, cfg.model.max_seq_len)
+    elif data_kind == "json":
+        from rbuild import load_manifest, manifest_batches
+        path = ask("json_path", "path to manifest (.json or .jsonl)", "data.json",
+                   hint='[{"text": "a cat", "images": ["cat.jpg"]}, '
+                        '{"text": "a clip", "video": "clip.mp4"}, ...] — '
+                        "paths or https links; works blind too (media ignored)")
+        while not os.path.exists(path):
+            path = ask("json_path", "not found — path to manifest", "data.json")
+        has_video = any(e.get("video") for e in load_manifest(path))
+        n_frames = min(4, cfg.vision.max_video_frames) if has_video else 1
+        _fit_seq_for_vision(cfg, n_frames=n_frames)
+        batches = manifest_batches(path, cfg, n_frames=n_frames)
     elif data_kind == "hf":
-        tok_name = ask("hf_tokenizer", "tokenizer (HF id)", "gpt2")
-        ds_name = ask("hf_dataset", "dataset (HF id)", "wikitext",
-                      hint="streams — no full download")
-        batches = hf_batches(tok_name, ds_name, cfg.effective_vocab_size(),
-                             cfg.train.batch_size, cfg.model.max_seq_len)
+        if cfg.vision.enabled:
+            hf_kind = ask("hf_kind", "hf data kind", "image",
+                          choices=["text", "image", "video"],
+                          hint="image/video = no-fuss vision training, columns auto-detect")
+        else:
+            hf_kind = ask("hf_kind", "hf data kind", "text", choices=["text"],
+                          hint="vision is off — enable it in step 5 for image/video training")
+        if hf_kind == "image":
+            from rbuild import hf_image_batches
+            ds_name = ask("hf_dataset", "dataset (HF id)",
+                          "lambdalabs/naruto-blip-captions",
+                          hint="any HF dataset with image + caption columns — auto-detected")
+            _fit_seq_for_vision(cfg, n_frames=1)
+            batches = hf_image_batches(ds_name, cfg)
+        elif hf_kind == "video":
+            from rbuild import hf_video_batches
+            ds_name = ask("hf_dataset", "dataset (HF id)",
+                          "friedrichor/MSR-VTT",
+                          hint="any HF dataset with video + caption columns — auto-detected")
+            n_frames = min(4, cfg.vision.max_video_frames)
+            _fit_seq_for_vision(cfg, n_frames=n_frames)
+            batches = hf_video_batches(ds_name, cfg, n_frames=n_frames)
+        else:
+            tok_name = ask("hf_tokenizer", "tokenizer (HF id)", "gpt2")
+            ds_name = ask("hf_dataset", "dataset (HF id)", "wikitext",
+                          hint="streams — no full download")
+            batches = hf_batches(tok_name, ds_name, cfg.effective_vocab_size(),
+                                 cfg.train.batch_size, cfg.model.max_seq_len)
     else:
         batches = toy_batches(cfg.effective_vocab_size(),
                               cfg.train.batch_size, cfg.model.max_seq_len)

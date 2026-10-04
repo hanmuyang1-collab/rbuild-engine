@@ -177,8 +177,94 @@ def test_rbuild_backend():
           r.json()["kv_cache_full"] is True)
 
 
+def test_vl_manifest_data():
+    """v3.1 data layer: manual JSON manifest trains vision + blind models."""
+    print("== vl manifest data layer ==")
+    import json
+    import shutil
+    import subprocess
+    import tempfile
+    import torch
+    from PIL import Image
+    from rbuild import (RBuildConfig, RBuildModel, Trainer, manifest_batches,
+                        vision_tokens_per_sample)
+
+    root = tempfile.mkdtemp(prefix="rbuild_data_")
+    Image.new("RGB", (32, 32), (200, 30, 30)).save(os.path.join(root, "a.png"))
+    Image.new("RGB", (32, 32), (30, 30, 200)).save(os.path.join(root, "b.png"))
+    clip = os.path.join(root, "clip.mp4")
+    if shutil.which("ffmpeg"):
+        subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i",
+                        "testsrc=duration=1:size=48x48:rate=8",
+                        "-pix_fmt", "yuv420p", clip],
+                       capture_output=True, check=True)
+    entries = [
+        {"text": "red square", "images": [os.path.join(root, "a.png")]},
+        {"text": "blue square", "images": [os.path.join(root, "b.png"),
+                                           os.path.join(root, "a.png")]},
+        {"text": "no media here"},
+    ]
+    if os.path.exists(clip):
+        entries.append({"text": "a test clip", "video": clip})
+    mpath = os.path.join(root, "manifest.jsonl")
+    with open(mpath, "w") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+
+    cfg = RBuildConfig()
+    cfg.model.max_seq_len = 96
+    cfg.critic.max_loops = 2
+    cfg.vision.enabled = True
+    cfg.vision.image_size = 48
+    cfg.vision.patch_size = 8
+    cfg.vision.image_token_id = 255
+    cfg.vision.vit_heads = 8
+    cfg.validate()
+    cfg.train.max_steps = 2
+    cfg.train.batch_size = 4
+
+    model = RBuildModel(cfg)
+    check("vl counter-verified",
+          sum(p.numel() for p in model.parameters())
+          == cfg.count_parameters()["total_params"])
+
+    batches = manifest_batches(mpath, cfg, n_frames=2, shuffle=False)
+    x, y, images = next(iter(batches))
+    check("manifest yields (x, y, images)",
+          x.shape == (4, 96) and images.shape[1] == 2,
+          f"images {tuple(images.shape)}")
+    K = vision_tokens_per_sample(cfg, 2)
+    check("placeholder run == K",
+          bool(((x == 255).sum(1) == K).all()), f"K={K}")
+
+    hist = Trainer(model, cfg, device="cpu", log_fn=None).fit(
+        manifest_batches(mpath, cfg, n_frames=2, shuffle=False), max_steps=2)
+    check("vl manifest training", len(hist["loss"]) == 2,
+          f"loss {hist['loss'][-1]:.3f}")
+    # Trainer zeroes grads after each step — verify grad flow on a fresh pass
+    model.zero_grad(set_to_none=True)
+    model(x, targets=y, images=images)[1].backward()
+    vgrad = any(p.grad is not None and p.grad.abs().sum() > 0
+                for p in model.vision.parameters())
+    check("vision tower receives gradients", vgrad)
+
+    # blind model: same manifest, media ignored, (x, y) batches
+    cfg_b = RBuildConfig()
+    cfg_b.model.max_seq_len = 64
+    cfg_b.critic.max_loops = 2
+    cfg_b.train.max_steps = 1
+    model_b = RBuildModel(cfg_b)
+    batch_b = next(iter(manifest_batches(mpath, cfg_b, batch=3, seq=64,
+                                         shuffle=False)))
+    check("blind manifest yields (x, y)", len(batch_b) == 2)
+    hist_b = Trainer(model_b, cfg_b, device="cpu", log_fn=None).fit(
+        manifest_batches(mpath, cfg_b, batch=3, seq=64), max_steps=1)
+    check("blind manifest training", len(hist_b["loss"]) == 1)
+
+
 if __name__ == "__main__":
     test_engine_swap()
     test_http_layer()
     test_rbuild_backend()
+    test_vl_manifest_data()
     print(f"\nSMOKE TEST PASSED — {len(passed)} checks green")
