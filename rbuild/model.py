@@ -295,7 +295,7 @@ class RBuildModel(nn.Module):
         self._runtime_max_loops: Optional[int] = None
         self._runtime_y_critics: Optional[int] = None
         self._runtime_sampling: Optional[dict] = None
-        self._runtime_self_observe: bool = cfg.noting.enabled and cfg.noting.auto_train
+        self._runtime_self_observe: bool = cfg.noting.enabled and cfg.noting.nsct
         self._active_thinking_mode: Optional[str] = None
         self._watermarker_obj = None
         self.thinking_mode = ThinkingModes(self)
@@ -304,11 +304,11 @@ class RBuildModel(nn.Module):
                 self.thinking_mode.apply(cfg.thinking.default_mode)
             except KeyError:
                 pass
-        # v3.1: self-training while running is OPT-IN — startup never
-        # auto-trains unless noting.auto_train=True, even if the default
-        # thinking mode carries self_observe=True. Explicitly applying a
-        # mode or calling set_auto_train(True) turns it on later.
-        if not cfg.noting.auto_train:
+        # v3.1: NSCT (non-separate continuous training) is OPT-IN —
+        # startup never self-trains unless noting.nsct=True, even if the
+        # default thinking mode carries self_observe=True. Explicitly
+        # applying a mode or calling set_nsct(True) turns it on later.
+        if not cfg.noting.nsct:
             self._runtime_self_observe = False
 
         self.apply(self._init)
@@ -427,13 +427,18 @@ class RBuildModel(nn.Module):
         return {"enabled": True, **self.self_learner.stats()}
 
     # ------------------------------------------------------------------ #
-    def set_auto_train(self, on: bool = True) -> None:
+    def set_nsct(self, on: bool = True) -> None:
         """
-        The auto-train switch: toggle self-training-while-running at runtime.
+        The NSCT switch: toggle non-separate continuous training
+        (self-training-while-running) at runtime.
         Off (the default) = pure inference, no notes taken, nothing learned.
         """
-        self.cfg.noting.auto_train = bool(on)
+        self.cfg.noting.nsct = bool(on)
         self._runtime_self_observe = bool(on) and self.self_learner is not None
+
+    def set_auto_train(self, on: bool = True) -> None:
+        """Legacy alias for set_nsct() — kept for v3.1 scripts."""
+        self.set_nsct(on)
 
     # ------------------------------------------------------------------ #
     def _chunked_ce(self, logits, targets):

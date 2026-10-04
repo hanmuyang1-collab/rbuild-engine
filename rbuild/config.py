@@ -150,12 +150,12 @@ class NotingConfig:
     with a real gradient step. No separate training phase, no separate
     verification phase: running and learning happen in parallel.
 
-    v3.1: this is OPT-IN. `auto_train=False` (default) means the model
-    never self-trains unless you turn it on — per config, per call
-    (`model.set_auto_train(True)`), or per thinking mode (`self_observe`).
+    v3.1: NSCT is OPT-IN. `nsct=False` (default) means the model never
+    self-trains unless you turn it on — per config, per call
+    (`model.set_nsct(True)`), or per thinking mode (`self_observe`).
     """
     enabled: bool = True
-    auto_train: bool = False         # self-train while running: OFF by default
+    nsct: bool = False               # non-separate continuous training: OFF by default
     n_noting_experts: int = 2        # separate note-taking experts
     note_hidden: Optional[int] = None  # None -> d_model
     verify_y_critics: int = 2        # critics that must approve a note
@@ -166,6 +166,17 @@ class NotingConfig:
     buffer_capacity: int = 4096      # CPU fp16 note buffer (low RAM)
     self_train_batch: int = 128      # notes per consolidation step
     observe_in_training: bool = False  # also take notes during fit()
+
+    # v3.1 legacy alias — checkpoints/scripts written before the NSCT
+    # rename still say `auto_train`; reads and writes map onto `nsct`
+    # (from_dict() picks it up automatically via hasattr/setattr).
+    @property
+    def auto_train(self) -> bool:
+        return self.nsct
+
+    @auto_train.setter
+    def auto_train(self, v: bool) -> None:
+        self.nsct = bool(v)
 
 
 @dataclass
@@ -582,7 +593,7 @@ class RBuildConfig:
         if self.noting.enabled:
             noting_line = (f"{self.noting.n_noting_experts} note-takers, critic-verified "
                            f"({self.noting.verify_y_critics}y@{self.noting.verify_threshold})"
-                           f", auto-train={'on' if self.noting.auto_train else 'off'}")
+                           f", NSCT={'on' if self.noting.nsct else 'off'}")
         else:
             noting_line = "off"
         if self.actuation.enabled:
