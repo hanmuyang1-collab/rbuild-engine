@@ -139,9 +139,11 @@ class CriticConfig:
 @dataclass
 class NotingConfig:
     """
-    v3 — noting experts + critic-verified non-separate self-training.
+    v3 — noting experts + critic-verified non-separate continuous training.
 
-    During normal forwards (including generation), noting experts propose
+    NSCT = non-separate continuous training: training and running happen
+    SIMULTANEOUSLY, at low RAM. During normal forwards (including
+    generation), noting experts propose
     candidate facts from the final hidden states. The generative stages'
     critics verify each note; verified notes are (a) written into the
     fast-weight memory immediately (gradient-free — the model learns while
@@ -155,7 +157,7 @@ class NotingConfig:
     (`model.set_nsct(True)`), or per thinking mode (`self_observe`).
     """
     enabled: bool = True
-    nsct: bool = False               # non-separate continuous training: OFF by default
+    nsct: bool = False               # NSCT: train & run simultaneously, low RAM — OFF by default
     n_noting_experts: int = 2        # separate note-taking experts
     note_hidden: Optional[int] = None  # None -> d_model
     verify_y_critics: int = 2        # critics that must approve a note

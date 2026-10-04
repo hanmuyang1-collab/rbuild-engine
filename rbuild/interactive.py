@@ -247,7 +247,7 @@ def chat(model, encode, decode, max_new_tokens: int = 64) -> None:
       /forget        reset the fast-weight memory
       /selfstats     critic-verified self-learning stats
       /nsct on|off           toggle non-separate continuous training
-                             (self-training while running; default off)
+                             (train+run simultaneously, low RAM; default off)
       /watermark on|off      toggle generation watermarking
       /detect <text>         z-test text for your watermark
       /config        show the live config report

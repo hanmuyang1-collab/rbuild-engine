@@ -113,8 +113,9 @@ model.thinking_mode.list()                    # all modes + knobs
 
 ### Self-training while running (NSCT)
 
-NSCT = non-separate continuous training: running and learning are the same
-pass, no separate training phase. It is opt-in (off by default):
+NSCT = non-separate continuous training: **training and running happen
+simultaneously**, in the same pass, at low RAM — no separate training
+phase. It is opt-in (off by default):
 
 ```python
 cfg.noting.nsct = True              # OPT-IN: off by default

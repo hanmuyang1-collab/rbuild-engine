@@ -74,10 +74,12 @@ Every parallel bundle stage (the generative layers) carries its own
 
 Critics cost ~0.5% of total parameters at s1 (101M of 20.0B).
 
-## 3. Noting experts + non-separate self-training
+## 3. Noting experts + non-separate continuous training (NSCT)
 
 "Non-separate" = there is **no separate training phase and no separate
-verification phase**. One forward pass does all of it:
+verification phase** — training and running are *simultaneous*, and the
+whole thing is engineered for **low RAM** (gradient-free memory writes,
+CPU fp16 note buffer). One forward pass does all of it:
 
 ```
 forward pass (training OR generation — running is running)
@@ -101,7 +103,8 @@ forward pass (training OR generation — running is running)
 - **Fast path (parallel running and learning):** gradient-free delta-rule
   writes happen inside the observing forward pass itself.
 - **Opt-in gate (v3.1):** none of this runs unless you ask for it. NSCT
-  (non-separate continuous training) is controlled by `noting.nsct`;
+  (non-separate continuous training — training and running are
+  *simultaneous*, at low RAM) is controlled by `noting.nsct`;
   `False` (the default) means startup never self-trains —
   pure inference, no notes taken, nothing written. Three ways to turn it
   on: the config flag, `model.set_nsct(True)` at runtime, or

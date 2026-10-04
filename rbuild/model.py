@@ -429,8 +429,9 @@ class RBuildModel(nn.Module):
     # ------------------------------------------------------------------ #
     def set_nsct(self, on: bool = True) -> None:
         """
-        The NSCT switch: toggle non-separate continuous training
-        (self-training-while-running) at runtime.
+        The NSCT switch: toggle non-separate continuous training at runtime.
+        NSCT = training and running SIMULTANEOUSLY, at low RAM — the model
+        learns from what it observes while it serves, no separate phase.
         Off (the default) = pure inference, no notes taken, nothing learned.
         """
         self.cfg.noting.nsct = bool(on)
