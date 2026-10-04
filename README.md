@@ -1,8 +1,11 @@
 # R-Build v3
 
-**A fully user-modifiable, open-source LLM architecture + training-speed engine — now self-governing.**
+**A fully user-modifiable, open-source LLM architecture + training-speed engine — now self-governing, and self-serving.**
 Every knob is yours: programmatically, through an interactive widget panel in
 Colab/Jupyter, or a console prompt anywhere else.
+
+v3.1 merges **R-Run** into this repo — R-Build builds and trains the models,
+R-Run serves them. One repo, one engine: `rrun serve` / `rrun swap`.
 
 ## What's new in v3
 
@@ -39,6 +42,10 @@ tokens ─► embed ─► EXTRACTION LOOP ─► PARALLEL STAGE 1 ─► ... �
    immediately* (the model learns while running, ~zero extra RAM) and queued
    in a CPU fp16 buffer for `Trainer.self_train_step()` to consolidate into
    the slow weights. Running and learning are the same pass.
+   **v3.1: this is opt-in.** Self-training-while-running is OFF by default
+   (`noting.auto_train=False`) — turn it on per config, per call
+   (`model.set_auto_train(True)`), per chat command (`/autotrain on`), or
+   per thinking mode (`self_observe`).
 4. **Thinking-mode creator.** `model.thinking_mode.<mode>(<value>)` retunes
    loops, Y-critics, thresholds and sampling live — built-ins
    `fast/balanced/deep/careful/research`, and mint your own with
@@ -57,6 +64,12 @@ tokens ─► embed ─► EXTRACTION LOOP ─► PARALLEL STAGE 1 ─► ... �
    a secret-keyed green list, so anything your model writes is provably
    yours — `WatermarkDetector` runs a z-test with the same key. Pure
    sampling-time signal: zero parameters, checkpoints unaffected.
+8. **R-Run serving, merged in (v3.1).** The `rrun` package hosts any model
+   with one command and hot-swaps the resident model with **zero server
+   restart** and a **full KV cache** for the new model — OpenAI-compatible
+   API included. The native `rbuild` backend serves R-Build checkpoints
+   directly (no conversion); `vllm`, `hf` and `mock` backends cover
+   everything else.
 
 Everything v3 can be switched off independently; with `critic`, `noting`,
 `actuation` and `vision` all disabled the architecture is bit-identical to
@@ -69,6 +82,7 @@ pip install git+https://github.com/hanmuyang1-collab/rbuild-engine@v3   # v3 bra
 pip install .                       # or from a local clone
 pip install .[notebook]             # + ipywidgets for the interactive panel
 pip install .[train]                # + transformers/datasets for the training script
+pip install .[serve]                # + fastapi/uvicorn for the rrun server
 ```
 
 ## Use it — everything is modifiable
@@ -100,13 +114,42 @@ model.thinking_mode.list()                    # all modes + knobs
 ### Self-training while running
 
 ```python
+cfg.noting.auto_train = True        # OPT-IN: off by default
+model = RBuildModel(cfg)
 model.eval()
 out = model.generate(ids)           # noting experts observe this pass
 model.self_learn_stats()            # {'notes_verified': ..., 'accept_rate': ..., 'buffered': ...}
 
+model.set_auto_train(False)         # toggle at runtime — pure inference again
+model.set_auto_train(True)          # learn while running again
+
 trainer = Trainer(model, cfg)
 trainer.self_train_step()           # consolidate verified notes into slow weights
 # or automatically during fit: cfg.train.self_train_every = 100
+```
+
+### Serve it — R-Run is built in
+
+```bash
+rrun serve ./ckpt --backend rbuild          # host a native R-Build checkpoint
+rrun swap  ./ckpt_v2 --backend rbuild       # hot-swap: wipe old, full KV for new
+rrun status                                 # resident model + KV cache state
+rrun serve Qwen/Qwen3-32B                   # HF/vLLM models work too
+```
+
+The HTTP server never restarts on swap — same port, same connections, new
+model. OpenAI-compatible endpoints (`/v1/chat/completions`, `/v1/models`)
+plus admin endpoints (`/admin/swap`, `/admin/wipe`, `/admin/status`).
+Byte-level tokenization by default (matches local .txt training); pass a
+tokenizer for HF-trained checkpoints:
+
+```python
+from rrun.backends import RBuildBackend
+from rrun.engine import RRunEngine
+
+eng = RRunEngine(RBuildBackend(tokenizer="gpt2", watermark=True))
+eng.serve("./ckpt")
+eng.chat([{"role": "user", "content": "hello"}])
 ```
 
 ### Native actuation
@@ -154,6 +197,7 @@ model = ui.model
 interactive.chat(model, encode, decode)
 # /mode deep      switch thinking mode live      /modes     list modes
 # /selfstats      self-learning counters         /remember  gradient-free fact write
+# /autotrain on   self-training while running (default off)
 ```
 
 ## Stage ladder presets (continued-training path)

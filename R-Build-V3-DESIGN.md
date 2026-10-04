@@ -100,6 +100,14 @@ forward pass (training OR generation — running is running)
 
 - **Fast path (parallel running and learning):** gradient-free delta-rule
   writes happen inside the observing forward pass itself.
+- **Opt-in gate (v3.1):** none of this runs unless you ask for it.
+  `noting.auto_train=False` (the default) means startup never self-trains —
+  pure inference, no notes taken, nothing written. Three ways to turn it
+  on: the config flag, `model.set_auto_train(True)` at runtime, or
+  explicitly applying a thinking mode with `self_observe=True`. The gate is
+  enforced *after* the default thinking mode is applied in `__init__`, so a
+  mode's `self_observe` only counts when the mode was applied by the user,
+  not by default.
 - **Slow path (consolidation):** batched, rare, GPU-efficient; runs on
   demand or every `train.self_train_every` steps inside `fit()`.
 - **RAM discipline:** notes live on CPU in fp16 (`buffer_capacity` cap,
@@ -202,3 +210,36 @@ naive-vs-optimized cost side by side. v3 overhead at s1: +101M critics,
   sections take defaults.
 - The fast-weight memory matrix, checkpoint format, and
   `Trainer` save/load are unchanged.
+- v3.1 behavior note: weights and configs are fully compatible with v3.0,
+  but self-training-while-running now defaults to OFF
+  (`noting.auto_train=False`). A v3.0 run that silently learned during
+  generation stays purely inferential in v3.1 until you opt in — set
+  `noting.auto_train=True` to restore the old behavior exactly.
+
+## 10. Serving — R-Run, merged in (v3.1)
+
+The R-Run serving engine is now part of this repo as the `rrun` package:
+R-Build builds and trains the models, R-Run serves them.
+
+- **Swap contract:** `RRunEngine.swap(model_id)` takes a swap lock, wipes
+  the old KV cache and weights completely, loads the new model, allocates
+  the **full** KV cache for it, and releases the lock. The HTTP server
+  never restarts — the port stays bound and clients keep their
+  connections; only the resident model changes.
+- **KV discipline:** `KVCacheManager` sizes the cache from the model's real
+  geometry (`2 × n_layers × n_kv_heads × head_dim × dtype_bytes` per token)
+  and always rebuilds it at full capacity on every swap — never shrunk for
+  speed.
+- **Backends:** `rbuild` (native `Trainer.save_checkpoint` directories via
+  `Trainer.load_checkpoint` — byte-level UTF-8 tokenization by default,
+  optional HF tokenizer, watermark passthrough, KV sized from R-Build
+  geometry: loop blocks + every branch of every stage), `vllm` (GPU fast
+  path), `hf` (transformers, CPU-friendly), `mock` (no weights, smoke
+  tests).
+- **API:** OpenAI-compatible `/v1/chat/completions` + `/v1/models`, admin
+  `/admin/swap` / `/admin/wipe` / `/admin/status`. CLI:
+  `rrun serve <model> --backend rbuild`, `rrun swap <model>`,
+  `rrun status`, `rrun wipe`.
+- Serving is pure inference by default — the auto-train gate (§3) applies
+  to served models too, so a resident model never self-trains unless the
+  operator opts in.
