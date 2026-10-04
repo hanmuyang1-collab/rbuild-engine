@@ -18,6 +18,8 @@ A mode is just a dict of knobs:
     temperature     — default sampling temperature in this mode
     top_p           — default nucleus value
     self_observe    — whether noting/verification runs during generation
+                      (explicitly applying a mode turns it on even when
+                      noting.auto_train=False; startup never does)
 
 Built-ins: fast, balanced, deep, careful, research. Create your own with
 create(); they persist on the model (and into checkpoints via the config
