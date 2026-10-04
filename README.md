@@ -192,6 +192,34 @@ model = RBuildModel(cfg)
 logits, loss = model(ids, targets=ids, images=imgs)   # imgs: (B, frames, C, H, W)
 ```
 
+### Data: manual JSON manifest + no-fuss HF image/video
+
+Every model type (blind, ViT, encoderless) trains from one manual JSON
+manifest — text plus links to pictures/videos (local paths or https URLs):
+
+```json
+[{"text": "a cat on a mat", "images": ["cat.jpg", "https://…/cat2.png"]},
+ {"text": "a short clip",    "video":  "clip.mp4"},
+ {"text": "text only is fine too"}]
+```
+
+```python
+from rbuild import manifest_batches, hf_image_batches, hf_video_batches
+
+batches = manifest_batches("data.json", cfg)     # .json or .jsonl, any model type
+batches = hf_image_batches("lambdalabs/naruto-blip-captions", cfg)  # vision on
+batches = hf_video_batches("friedrichor/MSR-VTT", cfg)              # vision on
+trainer.fit(batches)   # (x, y) or (x, y, images) — Trainer handles both
+```
+
+No fuss: HF columns auto-detect from the first row (override with
+`text_column=` / `image_column=` / `video_column=`), images decode/resize
+themselves, videos sample frames uniformly (decord → imageio → ffmpeg,
+whatever is installed), and `<image>` placeholder runs are spliced to the
+exact length the vision tower expects. Mixed batches pad clips to the
+longest and give text-only samples black frames. Blind configs read the
+same manifests and simply ignore the media.
+
 ### Interactive panel (Colab / Jupyter)
 
 ```python

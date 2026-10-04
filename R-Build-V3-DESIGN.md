@@ -249,3 +249,34 @@ R-Build builds and trains the models, R-Run serves them.
 - Serving is pure inference by default — the NSCT gate (§3) applies
   to served models too, so a resident model never self-trains unless the
   operator opts in.
+
+## 11. Data — manual JSON manifest + no-fuss HF image/video (`rbuild/data.py`)
+
+One data layer for every model type. Generators yield `(x, y)` for blind
+configs and `(x, y, images)` for vision configs; `Trainer.fit()` accepts
+both batch shapes.
+
+- **Manual JSON manifest (any model type):** a `.json` list or `.jsonl`
+  file of `{"text": ..., "images": [...], "video": ...}` entries. Media
+  values are local paths or https URLs; images may also be `{"path"|"bytes"}`
+  dicts. Blind configs load the same manifest and ignore media (one-time
+  notice) — the manifest format is universal.
+- **Placeholder splicing:** each sample's token stream is one run of
+  `vision.image_token_id` placeholders of exactly the length the vision
+  tower will emit (`n_frames × tokens_per_image`, plus VaWU whole-video
+  tokens when enabled), followed by byte-level UTF-8 text. Truncation
+  never cuts the placeholder run — if the run alone exceeds `seq`, a
+  clear error says to raise `seq`.
+- **Mixed batches:** clips pad to the batch's longest frame count by
+  repeating the last frame; text-only samples in a vision batch get black
+  (zero) frames so every sample has the same placeholder count K that
+  `_splice_vision` requires.
+- **Video decode fallback chain:** decord → imageio → ffmpeg/ffprobe
+  subprocess. None is mandated; whatever is installed is used. Frames are
+  sampled uniformly over the clip and resized to `vision.image_size`.
+- **HF streaming (no-fuss):** `hf_image_batches` / `hf_video_batches`
+  stream any dataset (`load_dataset(..., streaming=True)`), auto-detect
+  the text/image/video columns from the first row (PIL objects, media
+  paths/URLs, or `{"bytes"|"path"}` dicts), and print the mapping once.
+  Override with `text_column=` / `image_column=` / `video_column=`.
+  Rows whose media fails to decode are skipped with a one-time notice.
