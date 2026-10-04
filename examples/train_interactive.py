@@ -80,7 +80,11 @@ def ask(key, question, default, cast=str, choices=None, hint=""):
     """
     global _step
     if AUTO or ANSWERS.get(key) is not None:
-        return cast(ANSWERS[key]) if ANSWERS.get(key) is not None else _cast_default(default, cast)
+        val = ANSWERS.get(key)
+        if val is not None:
+            # typed answers (True/12/0.5) are used as-is; strings get cast
+            return val if not isinstance(val, str) else cast(val)
+        return _cast_default(default, cast)
     _step += 1
     opts = f"  options: {' / '.join(map(str, choices))}" if choices else ""
     if hint:
