@@ -149,8 +149,13 @@ class NotingConfig:
     `Trainer.self_train_step()` can consolidate them into the slow weights
     with a real gradient step. No separate training phase, no separate
     verification phase: running and learning happen in parallel.
+
+    v3.1: this is OPT-IN. `auto_train=False` (default) means the model
+    never self-trains unless you turn it on — per config, per call
+    (`model.set_auto_train(True)`), or per thinking mode (`self_observe`).
     """
     enabled: bool = True
+    auto_train: bool = False         # self-train while running: OFF by default
     n_noting_experts: int = 2        # separate note-taking experts
     note_hidden: Optional[int] = None  # None -> d_model
     verify_y_critics: int = 2        # critics that must approve a note
@@ -576,7 +581,8 @@ class RBuildConfig:
             critic_line = "off"
         if self.noting.enabled:
             noting_line = (f"{self.noting.n_noting_experts} note-takers, critic-verified "
-                           f"({self.noting.verify_y_critics}y@{self.noting.verify_threshold})")
+                           f"({self.noting.verify_y_critics}y@{self.noting.verify_threshold})"
+                           f", auto-train={'on' if self.noting.auto_train else 'off'}")
         else:
             noting_line = "off"
         if self.actuation.enabled:
