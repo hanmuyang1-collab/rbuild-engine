@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rbuild-engine"
-version = "3.0.0"
-description = "R-Build v3: a fully user-modifiable open-source LLM architecture and training-speed engine. Critic-gated ACT-style adaptive extraction, critic experts on generative stages, critic-verified non-separate self-training (learn while running), thinking modes, encoderless VL with whole-video understanding, native action tokens, MoD routing, fine-grained MoE with shared expert, Muon optimizer, WSD schedule, chunked cross-entropy, gradient-free fast-weight memory."
+version = "3.1.0"
+description = "R-Build v3: a fully user-modifiable open-source LLM architecture and training-speed engine, now with R-Run serving built in. Critic-gated ACT-style adaptive extraction, critic experts on generative stages, critic-verified non-separate self-training (learn while running, opt-in), thinking modes, encoderless VL with whole-video understanding, native action tokens, generation watermarking, MoD routing, fine-grained MoE with shared expert, Muon optimizer, WSD schedule, chunked cross-entropy, gradient-free fast-weight memory — plus one-command hosting and hot-swap serving of any checkpoint with a full KV cache and zero server restarts."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "Apache-2.0"
 authors = [{ name = "GeoThinkAI" }]
-keywords = ["llm", "vlm", "moe", "muon", "fast-weight-memory", "act-halting", "critic-experts", "self-training", "agentic", "training", "architecture"]
+keywords = ["llm", "vlm", "moe", "muon", "fast-weight-memory", "act-halting", "critic-experts", "self-training", "agentic", "training", "architecture", "serving", "hot-swap"]
 dependencies = [
     "torch>=2.0",
 ]
@@ -18,10 +18,16 @@ dependencies = [
 [project.optional-dependencies]
 notebook = ["ipywidgets>=8.0"]
 train = ["transformers>=4.40", "datasets>=2.18"]
-dev = ["ipywidgets>=8.0", "transformers>=4.40", "datasets>=2.18"]
+serve = ["fastapi>=0.110", "uvicorn>=0.29", "pydantic>=2.0"]
+vllm = ["vllm>=0.6"]
+dev = ["ipywidgets>=8.0", "transformers>=4.40", "datasets>=2.18",
+       "fastapi>=0.110", "uvicorn>=0.29", "pydantic>=2.0"]
+
+[project.scripts]
+rrun = "rrun.cli:main"
 
 [project.urls]
 Homepage = "https://huggingface.co/GeoThinkAI"
 
 [tool.setuptools.packages.find]
-include = ["rbuild*"]
+include = ["rbuild*", "rrun*"]
