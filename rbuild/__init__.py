@@ -1,8 +1,12 @@
 """
 R-Build v3 — a fully user-modifiable, open-source LLM architecture and
 training-speed engine: critic-gated adaptive extraction, critic-verified
-non-separate self-training, thinking modes, encoderless VL/VaWU, and
-native actuation.
+non-separate self-training (opt-in), thinking modes, encoderless VL/VaWU,
+native actuation, and generation watermarking.
+
+v3.1 merges R-Run into this repo: the `rrun` package serves any R-Build
+checkpoint with one command and hot-swaps the resident model with zero
+server restart and a full KV cache (`rrun serve` / `rrun swap`).
 
 Quick start
 -----------
@@ -50,7 +54,7 @@ from .optim import Muon, WSDScheduler, build_optimizer
 from .train import Trainer
 from . import interactive
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 
 __all__ = [
     "RBuildConfig", "ModelConfig", "CacheLoopConfig", "ParallelConfig",
