@@ -47,11 +47,12 @@ ANSWERS = {
     "actuation": None,            # True/False (native action tokens)
     "steps": None,                # training steps (int)
     "batch_size": None,           # sequences per step (int)
-    "seq_len": None,              # tokens per sequence (int)
+    "seq_len": None,              # context length — tokens per sequence (int)
     "precision": None,            # "fp32" | "bf16" | "fp8"
     "self_train_every": None,     # consolidate notes every N steps (0 = off)
     "watermark": None,            # True/False (green-list generation watermark)
     "watermark_key": None,        # secret key for the watermark
+    "output_len": None,           # tokens to generate in the post-training demo
     "data": None,                 # "toy" | "text" | "hf"
     "data_path": None,            # path for "text" (local .txt file)
     "save_dir": None,             # checkpoint directory
@@ -66,6 +67,11 @@ ANSWERS = {
 _step = 0
 
 
+def _cast_default(default, cast):
+    """Enter/AUTO returns the default — cast it too ('n' -> False for ask_bool)."""
+    return cast(default) if (isinstance(default, str) and cast is not str) else default
+
+
 def ask(key, question, default, cast=str, choices=None, hint=""):
     """
     Ask one question. `default` is taken on Enter. `choices` (if given)
@@ -73,7 +79,7 @@ def ask(key, question, default, cast=str, choices=None, hint=""):
     """
     global _step
     if AUTO or ANSWERS.get(key) is not None:
-        return cast(ANSWERS[key]) if ANSWERS.get(key) is not None else default
+        return cast(ANSWERS[key]) if ANSWERS.get(key) is not None else _cast_default(default, cast)
     _step += 1
     opts = f"  options: {' / '.join(map(str, choices))}" if choices else ""
     if hint:
@@ -81,7 +87,7 @@ def ask(key, question, default, cast=str, choices=None, hint=""):
     while True:
         raw = input(f"  [{_step:02d}] {question} [{default}]{opts}: ").strip()
         if raw == "":
-            return default
+            return _cast_default(default, cast)
         try:
             val = cast(raw)
         except (ValueError, TypeError):
@@ -212,7 +218,7 @@ def main():
     print("\nSTEP 7 — training knobs")
     cfg.train.max_steps = ask("steps", "training steps", 50 if name == "tiny" else 2000, int)
     cfg.train.batch_size = ask("batch_size", "batch size", 4 if name == "tiny" else 8, int)
-    cfg.model.max_seq_len = ask("seq_len", "sequence length", 128 if name == "tiny" else 2048, int)
+    cfg.model.max_seq_len = ask("seq_len", "context length (tokens per sequence)", 128 if name == "tiny" else 2048, int)
     cfg.train.precision = ask("precision", "precision",
                               "fp32" if device == "cpu" else "bf16",
                               choices=["fp32", "bf16", "fp8"])
@@ -225,6 +231,8 @@ def main():
         False, hint="green-list logit bias with a secret key; zero params")
     if cfg.watermark.enabled:
         cfg.watermark.key = ask("watermark_key", "secret watermark key", "rbuild-v3")
+    output_len = ask("output_len", "output length (tokens to generate after training)",
+                     64, int, hint="context length is the input window; this is how long the model writes")
 
     # ---- 8. data -------------------------------------------------------- #
     print("\nSTEP 8 — data source")
@@ -271,6 +279,20 @@ def main():
     print(f"self-learning: {model.self_learn_stats()}")
     if model.cache_loop.last_halting:
         print(f"adaptive halting: {model.cache_loop.last_halting}")
+
+    # ---- generation smoke test (your selected output length) ----------- #
+    print(f"\ngeneration smoke test (output length = {output_len}) ...")
+    model.eval()
+    prompt = torch.randint(0, cfg.model.vocab_size, (1, min(16, cfg.model.max_seq_len)),
+                           device=device)
+    out = model.generate(prompt, max_new_tokens=output_len)
+    print(f"      context {prompt.shape[1]} tokens -> generated "
+          f"{out.shape[1] - prompt.shape[1]} tokens")
+    print(f"      first ids: {out[0, prompt.shape[1]:].tolist()[:24]} ...")
+    if cfg.watermark.enabled:
+        from rbuild import WatermarkDetector
+        det = WatermarkDetector(cfg.watermark, cfg.effective_vocab_size())
+        print(f"      watermark: {det.detect(out, skip_prompt=prompt.shape[1])}")
 
     # ---- 10. save (+ optional HF push) ---------------------------------- #
     print("\nSTEP 10 — save")
