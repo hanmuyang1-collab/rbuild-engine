@@ -55,6 +55,7 @@ from .layers.attention import CausalAttention, MoDRouter, RMSNorm
 from .layers.moe import build_ffn
 from .memory import FastWeightMemory
 from .vision import VisionTower
+from .outgen import OutGen
 from .critics import CriticPanel, ACTHalting
 from .noting import NotingExperts, SelfLearner
 from .thinking import ThinkingModes
@@ -291,6 +292,10 @@ class RBuildModel(nn.Module):
         self.action_head = ActuationHead(m.d_model, cfg.n_action_tokens()) \
             if cfg.actuation.enabled else None
 
+        # v3.1: generative OUTPUT heads — TTS / image OUT / video OUT,
+        # each decoded by a routed mixture of renderer experts (opt-in)
+        self.outgen = OutGen(cfg, m.d_model) if cfg.outgen.enabled else None
+
         # v3: runtime knobs driven by thinking modes
         self._runtime_max_loops: Optional[int] = None
         self._runtime_y_critics: Optional[int] = None
@@ -376,10 +381,9 @@ class RBuildModel(nn.Module):
         return ones, ones.to(torch.long) * 10**6
 
     # ------------------------------------------------------------------ #
-    def forward(self, input_ids: torch.Tensor,
-                targets: Optional[torch.Tensor] = None,
-                images: Optional[torch.Tensor] = None,
-                ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _encode(self, input_ids: torch.Tensor,
+                images: Optional[torch.Tensor] = None):
+        """The shared encoder path: embed -> extraction loop -> stages -> norm."""
         x, image_mask = self._splice_vision(input_ids, images)
         x = self.drop(x)
         x, ponder = self.cache_loop(x, self.memory,
@@ -390,7 +394,21 @@ class RBuildModel(nn.Module):
                 x = torch.utils.checkpoint.checkpoint(stage, x, use_reentrant=False)
             else:
                 x = stage(x)
-        x = self.final_norm(x)
+        return self.final_norm(x), image_mask, ponder
+
+    def hidden_states(self, input_ids: torch.Tensor,
+                      images: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Public access to the final hidden states (outgen heads read these)."""
+        x, _, _ = self._encode(input_ids, images)
+        return x
+
+    # ------------------------------------------------------------------ #
+    def forward(self, input_ids: torch.Tensor,
+                targets: Optional[torch.Tensor] = None,
+                images: Optional[torch.Tensor] = None,
+                out_targets: Optional[Dict[str, torch.Tensor]] = None,
+                ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        x, image_mask, ponder = self._encode(input_ids, images)
 
         # v3: non-separate self-training — note + verify + learn while running
         if (self.self_learner is not None and self._runtime_self_observe
@@ -407,10 +425,16 @@ class RBuildModel(nn.Module):
         if targets is not None:
             if image_mask is not None:
                 targets = targets.masked_fill(image_mask, -100)   # never predict vision positions
+            if self.outgen is not None:                           # nor outgen placeholder runs
+                for tid in self.outgen.placeholder_ids():
+                    targets = targets.masked_fill(input_ids == tid, -100)
             loss = self._chunked_ce(logits, targets)
             loss = loss + 0.01 * self._moe_aux_loss()
             if ponder is not None:                                # v3: ACT halting loss
                 loss = loss + self.cfg.critic.halt_loss_weight * ponder
+            if self.outgen is not None and out_targets:           # v3.1: output heads
+                out_loss, out_bal = self.outgen.training_loss(input_ids, x, out_targets)
+                loss = loss + out_loss + out_bal
         return logits, loss
 
     # ------------------------------------------------------------------ #
@@ -495,13 +519,55 @@ class RBuildModel(nn.Module):
         return self._watermarker_obj
 
     # ------------------------------------------------------------------ #
+    # v3.1: media generation through the outgen heads
+    # ------------------------------------------------------------------ #
+    def _media_prompt(self, prompt_ids: torch.Tensor, token_id: int,
+                      n_tokens: int) -> torch.Tensor:
+        """Prompt + one run of the head's placeholders -> hidden states there."""
+        pad = torch.full((prompt_ids.shape[0], n_tokens), token_id,
+                         dtype=torch.long, device=prompt_ids.device)
+        ids = torch.cat([prompt_ids, pad], dim=1)
+        assert ids.shape[1] <= self.cfg.model.max_seq_len, \
+            f"prompt + {n_tokens} output placeholders exceeds max_seq_len"
+        x = self.hidden_states(ids)
+        return x[:, -n_tokens:]
+
+    @torch.no_grad()
+    def generate_image(self, prompt_ids: torch.Tensor) -> torch.Tensor:
+        """Text/vision prompt -> image tensor (B, 3, S, S) in [0, 1]."""
+        assert self.outgen is not None and self.outgen.image_head is not None, \
+            "generate_image needs outgen.enabled=True and outgen.image=True"
+        self.eval()
+        h = self._media_prompt(prompt_ids, self.cfg.outgen.image_token_id,
+                               self.cfg.n_image_out_tokens())
+        return self.outgen.decode_image(h)
+
+    @torch.no_grad()
+    def generate_video(self, prompt_ids: torch.Tensor) -> torch.Tensor:
+        """Text/vision prompt -> clip tensor (B, F, 3, S, S) in [0, 1]."""
+        assert self.outgen is not None and self.outgen.video_head is not None, \
+            "generate_video needs outgen.enabled=True and outgen.video=True"
+        self.eval()
+        h = self._media_prompt(prompt_ids, self.cfg.outgen.video_token_id,
+                               self.cfg.n_video_out_tokens())
+        return self.outgen.decode_video(h)
+
+    @torch.no_grad()
+    def generate_audio(self, prompt_ids: torch.Tensor) -> torch.Tensor:
+        """Text prompt -> waveform (B, L) in [-1, 1] at cfg.outgen.sample_rate."""
+        assert self.outgen is not None and self.outgen.tts_head is not None, \
+            "generate_audio needs outgen.enabled=True and outgen.tts=True"
+        self.eval()
+        h = self._media_prompt(prompt_ids, self.cfg.outgen.audio_token_id,
+                               self.cfg.outgen.audio_tokens)
+        return self.outgen.decode_audio(h)
+
     @torch.no_grad()
     def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 64,
                  temperature: Optional[float] = None, top_p: Optional[float] = None,
                  top_k: int = 0, eos_id: Optional[int] = None,
                  images: Optional[torch.Tensor] = None,
-                 watermark: Optional[bool] = None) -> torch.Tensor:
-        # thinking modes set the sampling defaults
+                 watermark: Optional[bool] = None) -> torch.Tensor:        # thinking modes set the sampling defaults
         rt = self._runtime_sampling or {}
         temperature = temperature if temperature is not None else rt.get("temperature", 1.0)
         top_p = top_p if top_p is not None else rt.get("top_p", 0.9)
