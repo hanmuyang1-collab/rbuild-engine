@@ -285,6 +285,47 @@ class VisionConfig:
 
 
 @dataclass
+class OutGenConfig:
+    """
+    v3.1: generative OUTPUT heads — TTS (audio OUT), image OUT, video OUT.
+
+    Same rules as the rest of R-Build: opt-in (enabled=False builds
+    nothing — bit-identical without it), counter-verified, every value
+    modifiable. The LLM's own hidden states at a head's placeholder
+    positions (<image_out> / <video_out> / <audio_out> token ids in the
+    input stream) are decoded by a *routed mixture of renderer experts* —
+    MoE applies to these modalities exactly like it does to text FFNs:
+    renderer experts specialize (color/texture, motion, prosody...) and a
+    learned router picks the top-k per output token. No external codec,
+    VAE or diffusion dependency — pixels/frames/waveform come straight
+    out of the transformer (decoderless output, the mirror of v3's
+    encoderless vision input).
+    """
+    enabled: bool = False            # master switch — OFF = zero params
+    image: bool = False              # image OUT head
+    video: bool = False              # video OUT head
+    tts: bool = False                # audio OUT head (TTS)
+    image_token_id: Optional[int] = None   # <image_out> placeholder id
+    video_token_id: Optional[int] = None   # <video_out> placeholder id
+    audio_token_id: Optional[int] = None   # <audio_out> placeholder id
+    # renderer MoE (per head)
+    hidden_mult: float = 2.0         # renderer expert width vs d_model
+    n_renderers: int = 4             # routed renderer experts per head
+    top_k_renderers: int = 2
+    moe_balance: float = 0.01        # load-balance aux loss weight
+    # image OUT geometry
+    image_size: int = 48
+    image_patch: int = 8
+    # video OUT geometry (frames x the image grid above)
+    video_frames: int = 8
+    # TTS OUT geometry
+    audio_tokens: int = 32           # chunks per utterance
+    audio_chunk: int = 256           # waveform samples per chunk
+    sample_rate: int = 16000
+    loss_weight: float = 1.0
+
+
+@dataclass
 class TrainConfig:
     """Training speed stack + cost model. All user-modifiable."""
     # optimization
@@ -332,6 +373,7 @@ class RBuildConfig:
     watermark: WatermarkConfig = field(default_factory=WatermarkConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
+    outgen: OutGenConfig = field(default_factory=OutGenConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
 
     # ------------------------------------------------------------------ #
@@ -357,6 +399,21 @@ class RBuildConfig:
 
     def effective_vocab_size(self) -> int:
         return self.model.vocab_size + self.n_action_tokens()
+
+    # v3.1 outgen derived sizes (shared by the counter and the builders)
+    def out_image_grid(self) -> int:
+        o = self.outgen
+        return o.image_size // o.image_patch
+
+    def n_image_out_tokens(self) -> int:
+        g = self.out_image_grid()
+        return g * g
+
+    def n_video_out_tokens(self) -> int:
+        return self.outgen.video_frames * self.n_image_out_tokens()
+
+    def out_audio_len(self) -> int:
+        return self.outgen.audio_tokens * self.outgen.audio_chunk
 
     # ------------------------------------------------------------------ #
     # validation
@@ -412,6 +469,28 @@ class RBuildConfig:
             if v.vawu:
                 assert v.video, "vawu requires vision.video=True"
                 assert v.vawu_tokens >= 1
+        # v3.1: generative output heads (TTS / image OUT / video OUT)
+        o = self.outgen
+        if o.enabled:
+            assert o.image or o.video or o.tts, \
+                "outgen.enabled=True needs at least one of image/video/tts"
+            assert o.image_size % o.image_patch == 0, \
+                "outgen image_size must divide image_patch"
+            assert 1 <= o.top_k_renderers <= o.n_renderers
+            assert o.video_frames >= 1 and o.audio_tokens >= 1 and o.audio_chunk >= 8
+            ids = {}
+            for name, on, tid in (("image", o.image, o.image_token_id),
+                                  ("video", o.video, o.video_token_id),
+                                  ("audio", o.tts, o.audio_token_id)):
+                if on:
+                    assert tid is not None, f"outgen.{name} needs a {name}_token_id"
+                    assert 0 <= tid < self.effective_vocab_size(), \
+                        f"outgen {name}_token_id must be inside the vocab"
+                    assert tid not in ids, "outgen placeholder ids must be distinct"
+                    ids[tid] = name
+            if v.enabled:
+                assert v.image_token_id not in ids, \
+                    "outgen placeholder ids must differ from vision.image_token_id"
 
     # ------------------------------------------------------------------ #
     # parameter counter (naive vs optimized stack)
@@ -527,11 +606,38 @@ class RBuildConfig:
             if v.vawu and v.video:
                 vision_params += v.vawu_tokens * d + 4 * d * d + d   # queries, MHA, norm
 
+        # v3.1 outgen heads (mirrors rbuild.outgen exactly)
+        outgen_params = 0
+        outgen_active = 0
+        o = self.outgen
+        if o.enabled:
+            rh = max(8, int(d * o.hidden_mult))            # renderer expert width
+            R, k = o.n_renderers, o.top_k_renderers
+            # one renderer expert: Linear(d,rh) + Linear(rh,out)
+            def renderer_head(out_dim: int, n_pos: int) -> int:
+                per_expert = d * rh + rh + rh * out_dim + out_dim
+                return d * R + R * per_expert + n_pos * d   # router + experts + pos
+            def renderer_head_active(out_dim: int, n_pos: int) -> int:
+                per_expert = d * rh + rh + rh * out_dim + out_dim
+                return d * R + k * per_expert + n_pos * d
+            patch_dim = o.image_patch * o.image_patch * 3
+            if o.image:
+                outgen_params += renderer_head(patch_dim, self.n_image_out_tokens())
+                outgen_active += renderer_head_active(patch_dim, self.n_image_out_tokens())
+            if o.video:
+                # patch_pos (grid²·d) + frame_pos (F·d), shared renderer
+                g_pos = self.n_image_out_tokens()
+                outgen_params += renderer_head(patch_dim, g_pos) + o.video_frames * d
+                outgen_active += renderer_head_active(patch_dim, g_pos) + o.video_frames * d
+            if o.tts:
+                outgen_params += renderer_head(o.audio_chunk, o.audio_tokens)
+                outgen_active += renderer_head_active(o.audio_chunk, o.audio_tokens)
+
         total = (cache_line + parallel_total + embed + head + fact_proj + final_norm
-                 + vision_params + noting_params + actuation_params)
+                 + vision_params + noting_params + actuation_params + outgen_params)
         active = cache_line_active * cl.mod_capacity + parallel_active * p.mod_capacity \
             + embed + head + fact_proj + final_norm + vision_params \
-            + noting_params + actuation_params
+            + noting_params + actuation_params + outgen_active
         return {
             "total_params": int(total),
             "active_params_per_token": int(active),
@@ -541,6 +647,7 @@ class RBuildConfig:
                                  * (1 + (p.n_stages if c.stage_critics else 0))),
             "noting_params": int(noting_params),
             "actuation_params": int(actuation_params),
+            "outgen_params": int(outgen_params),
             "embed_params": int(embed + head),
             "vision_params": int(vision_params),
             "memory_matrix": int(mem.key_dim * mem.value_dim if mem.enabled else 0),
@@ -609,6 +716,15 @@ class RBuildConfig:
                            f", vawu={'on' if self.vision.vawu else 'off'})")
         else:
             vision_line = "blind (off)"
+        if self.outgen.enabled:
+            kinds = [k for k, on in (("image", self.outgen.image),
+                                     ("video", self.outgen.video),
+                                     ("tts", self.outgen.tts)) if on]
+            outgen_line = (f"{'+'.join(kinds)} ({c['outgen_params']/1e6:.2f}M, "
+                           f"{self.outgen.n_renderers} renderer experts, "
+                           f"top-{self.outgen.top_k_renderers})")
+        else:
+            outgen_line = "off"
         lines = [
             "R-Build v3 configuration report",
             "=" * 56,
@@ -629,6 +745,7 @@ class RBuildConfig:
             f"  fast-weight memory: {'on' if self.memory.enabled else 'off'}"
             f" (key={self.memory.key_dim}, value={self.memory.value_dim})",
             f"  vision            : {vision_line}",
+            f"  output heads      : {outgen_line}",
             "-" * 56,
             f"  total params      : {fmt(c['total_params'])}",
             f"  active per token  : {fmt(c['active_params_per_token'])}",
