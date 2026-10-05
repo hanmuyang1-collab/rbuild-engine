@@ -47,6 +47,7 @@ from .model import RBuildModel, CacheLoopLine, ParallelBundleStage
 from .memory import FastWeightMemory
 from .vision import VisionTower, VaWUPooler
 from .outgen import OutGen, RendererMoE, ImageOutHead, VideoOutHead, TTSOutHead
+from .routgen import ROutGenModel, count_routgen_parameters
 from .critics import CriticExpert, CriticPanel, ACTHalting
 from .noting import NotingExperts, VerifiedNoteBuffer, SelfLearner
 from .thinking import ThinkingModes
@@ -69,6 +70,7 @@ __all__ = [
     "RBuildModel", "CacheLoopLine", "ParallelBundleStage",
     "FastWeightMemory", "VisionTower", "VaWUPooler",
     "OutGen", "RendererMoE", "ImageOutHead", "VideoOutHead", "TTSOutHead",
+    "ROutGenModel", "count_routgen_parameters",
     "CriticExpert", "CriticPanel", "ACTHalting",
     "NotingExperts", "VerifiedNoteBuffer", "SelfLearner",
     "ThinkingModes", "ActionCodec", "ActuationHead", "Action",
