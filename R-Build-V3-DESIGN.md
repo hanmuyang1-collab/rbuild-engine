@@ -325,3 +325,47 @@ DiT blocks in video generators, mixture-of-denoising-experts in T2I.)
 - **Counter-verified:** router + R renderer experts + position tables are
   mirrored exactly in `count_parameters()` (`outgen_params` in the
   report); `enabled=False` builds nothing — bit-identical v3.1.
+
+## 13. R-OutGen — the media-native model on the exact text trunk (`rbuild/routgen.py`)
+
+`ROutGenModel` answers "what does a pure R-Build generator look like"
+with: **the same architecture**. Its trunk is not a re-implementation —
+it imports and builds the very classes the text model uses:
+
+```
+prompt tokens (text, optional vision soft tokens)
+  -> embed
+  -> CacheLoopLine        (the extraction loop: critic-gated, ACT-halted,
+                           pulling the fast-weight cache — same class)
+  -> ParallelBundleStage x N  (fine-grained MoE branches + stage critic
+                               panels — same class)
+  -> final_norm
+  -> OutGen heads         (renderer MoE — the NATIVE output)
+```
+
+- **Exact trunk, same config.** One `RBuildConfig` drives both
+  `RBuildModel` and `ROutGenModel`; validation, init scheme, thinking
+  modes (`model.thinking_mode.deep()` governs how hard it thinks before
+  rendering), ACT halting, and `remember()` gradient-free fact writes all
+  behave identically.
+- **Only text-output machinery is dropped:** the LM head, the actuation
+  action head, and the noting experts — all text-vocabulary devices. The
+  media MSE + renderer balance loss is the sole training objective; there
+  is deliberately no text CE (`forward` accepts `targets=` for
+  `Trainer.fit` compatibility and ignores it, raising if it is the only
+  supervision given).
+- **Counter derivation (project invariant kept):**
+  `count_routgen_parameters(cfg)` starts from the canonical
+  `cfg.count_parameters()` and subtracts exactly the dropped pieces
+  (noting + actuation + untied LM head when `tie_embeddings=False`), so
+  the printed number matches `sum(p.numel())` on a built ROutGenModel —
+  verified in the smoke suite alongside a same-config `RBuildModel` to
+  prove the delta is precisely the text-output params.
+- **Stock Trainer, stock checkpoints.** `Trainer(model, cfg).fit(...)`
+  trains it unchanged from `*_out` manifest batches; checkpoints keep the
+  same `model.pt + rbuild_config.json + meta.json` format (with
+  `model_class: ROutGenModel` in meta), reloadable via
+  `ROutGenModel.load_checkpoint`.
+- **Relationship to §12:** `RBuildModel + outgen` is one model that does
+  text *and* media; `ROutGenModel` is the media-only build — no text
+  head, no text loss, the renderer MoE as the entire output side.

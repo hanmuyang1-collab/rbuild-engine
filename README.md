@@ -254,6 +254,34 @@ learns to *produce* the media after the text:
 handles it. Opt-in as always: `outgen.enabled=False` builds nothing and
 the model is bit-identical to plain v3.1.
 
+### R-OutGen — media-native model on the exact R-Build trunk
+
+`ROutGenModel` is not a new architecture — its trunk **is** the text
+model: the same `CacheLoopLine` extraction loop (critic-gated, ACT-halted,
+pulling the fast-weight cache), the same `ParallelBundleStage` generative
+stages (MoE branches + stage critic panels), the same `FastWeightMemory`,
+`VisionTower` and `ThinkingModes`, built from the same config. Only the
+text-*output* machinery is dropped (LM head, action head, noting
+experts); the renderer-MoE heads are the model's **native** output:
+
+```python
+from rbuild import ROutGenModel, count_routgen_parameters, Trainer
+
+model = ROutGenModel(cfg)         # same cfg as above — the exact text trunk
+assert sum(p.numel() for p in model.parameters()) \
+    == count_routgen_parameters(cfg)["total_params"]   # counter-verified
+
+trainer = Trainer(model, cfg)     # stock Trainer — the media MSE is the objective
+trainer.fit(manifest_batches("data.json", cfg))
+
+img = model.generate_image(ids)   # hidden states -> pixels/frames/waveform
+model.save_checkpoint("ckpt_routgen")          # same checkpoint format
+model = ROutGenModel.load_checkpoint("ckpt_routgen")
+```
+
+Thinking modes still govern how hard the trunk thinks before it renders;
+`remember()` writes facts gradient-free exactly like the text model.
+
 ### Interactive panel (Colab / Jupyter)
 
 ```python
