@@ -262,9 +262,101 @@ def test_vl_manifest_data():
     check("blind manifest training", len(hist_b["loss"]) == 1)
 
 
+def test_outgen_heads():
+    """v3.1 generative OUTPUT heads: TTS / image OUT / video OUT (renderer MoE)."""
+    print("== outgen heads (tts / image out / video out) ==")
+    import json
+    import math
+    import struct
+    import tempfile
+    import wave
+    import torch
+    from PIL import Image
+    from rbuild import RBuildConfig, RBuildModel, Trainer, manifest_batches
+
+    root = tempfile.mkdtemp(prefix="rbuild_outgen_")
+    Image.new("RGB", (48, 48), (220, 40, 40)).save(os.path.join(root, "red.png"))
+    wav_path = os.path.join(root, "tone.wav")
+    with wave.open(wav_path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        frames = b"".join(struct.pack("<h", int(12000 * math.sin(i / 10)))
+                          for i in range(16000))
+        w.writeframes(frames)
+    entries = [
+        {"text": "paint red", "image_out": os.path.join(root, "red.png")},
+        {"text": "play a tone", "audio_out": wav_path},
+        {"text": "plain text"},
+    ]
+    mpath = os.path.join(root, "manifest.json")
+    with open(mpath, "w") as f:
+        json.dump(entries, f)
+
+    cfg = RBuildConfig()
+    cfg.model.max_seq_len = 192
+    cfg.critic.max_loops = 2
+    o = cfg.outgen
+    o.enabled = True
+    o.image = o.video = o.tts = True
+    o.image_token_id, o.video_token_id, o.audio_token_id = 250, 251, 252
+    o.video_frames, o.audio_tokens = 2, 8
+    cfg.validate()
+
+    model = RBuildModel(cfg)
+    check("outgen counter-verified",
+          sum(p.numel() for p in model.parameters())
+          == cfg.count_parameters()["total_params"],
+          f"{cfg.count_parameters()['outgen_params']:,} outgen params")
+
+    batch = next(iter(manifest_batches(mpath, cfg, batch=3, seq=192,
+                                       shuffle=False)))
+    check("manifest yields (x, y, images, out_targets)", len(batch) == 4)
+    x, y, images, out_targets = batch
+    check("out targets present",
+          "image" in out_targets and "audio" in out_targets,
+          str({k: tuple(v.shape) for k, v in out_targets.items()}))
+
+    hist = Trainer(model, cfg, device="cpu", log_fn=None).fit(
+        manifest_batches(mpath, cfg, batch=3, seq=192, shuffle=False), max_steps=2)
+    check("outgen manifest training", len(hist["loss"]) == 2,
+          f"loss {hist['loss'][-1]:.3f}")
+    model.zero_grad(set_to_none=True)
+    model(x, targets=y, images=images, out_targets=out_targets)[1].backward()
+    for name, head in (("image", model.outgen.image_head),
+                       ("tts", model.outgen.tts_head)):
+        g = any(p.grad is not None and p.grad.abs().sum() > 0
+                for p in head.parameters())
+        check(f"{name} head receives gradients", g)
+
+    model.eval()
+    prompt = torch.tensor(list(b"say hi"), dtype=torch.long).unsqueeze(0)
+    img = model.generate_image(prompt)
+    wav = model.generate_audio(prompt)
+    vid = model.generate_video(prompt)
+    check("generate_image shape/range",
+          img.shape == (1, 3, 48, 48)
+          and 0 <= float(img.min()) <= float(img.max()) <= 1)
+    check("generate_audio shape/range",
+          wav.shape == (1, cfg.out_audio_len())
+          and -1 <= float(wav.min()) <= float(wav.max()) <= 1)
+    check("generate_video shape/range",
+          vid.shape == (1, 2, 3, 48, 48)
+          and 0 <= float(vid.min()) <= float(vid.max()) <= 1)
+
+    # checkpoint roundtrip keeps the heads
+    ckpt = os.path.join(root, "ckpt")
+    Trainer(model, cfg, device="cpu", log_fn=None).save_checkpoint(ckpt)
+    reloaded = Trainer.load_checkpoint(ckpt)
+    check("outgen checkpoint roundtrip",
+          reloaded.outgen is not None
+          and reloaded.generate_image(prompt).shape == img.shape)
+
+
 if __name__ == "__main__":
     test_engine_swap()
     test_http_layer()
     test_rbuild_backend()
     test_vl_manifest_data()
+    test_outgen_heads()
     print(f"\nSMOKE TEST PASSED — {len(passed)} checks green")

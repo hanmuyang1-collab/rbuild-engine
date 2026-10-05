@@ -280,3 +280,48 @@ both batch shapes.
   paths/URLs, or `{"bytes"|"path"}` dicts), and print the mapping once.
   Override with `text_column=` / `image_column=` / `video_column=`.
   Rows whose media fails to decode are skipped with a one-time notice.
+
+## 12. Generative output heads — TTS, image OUT, video OUT (`rbuild/outgen.py`)
+
+The output mirror of v3's encoderless vision: **decoderless output**. The
+LLM's own hidden states do the rendering — a head reads the hidden states
+at its placeholder run (`<image_out>` / `<video_out>` / `<audio_out>`
+token ids, appended after the prompt) and decodes them straight into
+pixels, frames, or waveform. No external codec, VAE, or diffusion stack;
+one transformer, media in and media out.
+
+**Is MoE usable for these modalities?** Yes — the same way it is for text
+FFNs, and this module is the proof. Each head decodes through a **routed
+mixture of renderer experts** (`RendererMoE`): a learned router sends
+every output token to its top-k renderer experts (2-layer MLPs to the
+modality's output dim), with a switch-style load-balance aux loss.
+Renderer experts specialize the way working experts do — color/texture
+experts in the image head, motion experts in the video head, prosody
+experts in the TTS head. (The same pattern appears in production
+T2I/TTS/video backbones: MoE feedforwards in AR TTS transformers, MoE
+DiT blocks in video generators, mixture-of-denoising-experts in T2I.)
+
+- **ImageOutHead:** `grid²` placeholders → per-token renderer → patch
+  pixels → unpatchified to `(B, 3, S, S)`, learned 2-D position table.
+- **VideoOutHead:** `F × grid²` placeholders → shared renderer, with a
+  frame-position table plus a patch-position table → `(B, F, 3, S, S)`.
+- **TTSOutHead:** `audio_tokens` placeholders → renderer → waveform
+  chunks of `audio_chunk` samples, `tanh`-bounded → `(B, L)` at
+  `outgen.sample_rate`.
+- **Training:** `forward(..., out_targets={"image"|"video"|"audio": T})`
+  adds `loss_weight`-scaled MSE against the decoded output (normalized
+  pixels `[0,1]`, waveform `[-1,1]`), per head, only over samples whose
+  input carries that head's placeholder run — mixed manifests are safe.
+  Out-placeholder positions never enter the text CE (masked like vision
+  positions). The balance loss rides along at `moe_balance` weight.
+- **Generation:** `model.generate_image/video/audio(prompt_ids)` appends
+  the head's placeholder run, encodes once, decodes. No autoregression
+  over pixels — one forward paints the whole canvas (thinking modes and
+  ACT halting still govern how hard the transformer thinks first).
+- **Data:** manifest entries add `"image_out"`, `"audio_out"`,
+  `"video_out"` (paths or URLs; `.wav` via the stdlib, anything else via
+  ffmpeg). `manifest_batches` emits `(x, y, images, out_targets)`;
+  `Trainer.fit` accepts 2/3/4-tuples unchanged otherwise.
+- **Counter-verified:** router + R renderer experts + position tables are
+  mirrored exactly in `count_parameters()` (`outgen_params` in the
+  report); `enabled=False` builds nothing — bit-identical v3.1.

@@ -220,6 +220,40 @@ exact length the vision tower expects. Mixed batches pad clips to the
 longest and give text-only samples black frames. Blind configs read the
 same manifests and simply ignore the media.
 
+### Generative output heads (TTS / image OUT / video OUT)
+
+The mirror of encoderless vision: **decoderless output**. The model's own
+hidden states at `<image_out>` / `<video_out>` / `<audio_out>`
+placeholders decode straight into pixels / frames / waveform — no codec,
+VAE, or diffusion dependency. Each head is a **routed mixture of renderer
+experts** (MoE works for these modalities exactly like for text FFNs:
+renderer experts specialize — color/texture, motion, prosody — with a
+switch-style load-balance loss).
+
+```python
+cfg.outgen.enabled = True
+cfg.outgen.image = cfg.outgen.video = cfg.outgen.tts = True
+cfg.outgen.image_token_id, cfg.outgen.video_token_id, cfg.outgen.audio_token_id = 250, 251, 252
+model = RBuildModel(cfg)            # counter-verified, heads included
+
+img = model.generate_image(ids)     # (B, 3, S, S) in [0,1]
+vid = model.generate_video(ids)     # (B, F, 3, S, S) in [0,1]
+wav = model.generate_audio(ids)     # (B, L) in [-1,1] @ cfg.outgen.sample_rate
+```
+
+Training uses the same manifest — add `*_out` targets and the model
+learns to *produce* the media after the text:
+
+```json
+[{"text": "paint a red square", "image_out": "red.png"},
+ {"text": "say hello",          "audio_out": "hello.wav"},
+ {"text": "make it move",        "video_out": "move.mp4"}]
+```
+
+`manifest_batches` emits `(x, y, images, out_targets)` and `Trainer.fit`
+handles it. Opt-in as always: `outgen.enabled=False` builds nothing and
+the model is bit-identical to plain v3.1.
+
 ### Interactive panel (Colab / Jupyter)
 
 ```python
