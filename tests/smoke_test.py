@@ -353,10 +353,105 @@ def test_outgen_heads():
           and reloaded.generate_image(prompt).shape == img.shape)
 
 
+def test_routgen_model():
+    """R-OutGen: media-native model on the EXACT R-Build text trunk."""
+    print("== r-outgen (media-native, exact text trunk) ==")
+    import json
+    import math
+    import struct
+    import tempfile
+    import wave
+    import torch
+    from PIL import Image
+    from rbuild import (RBuildConfig, RBuildModel, ROutGenModel, Trainer,
+                        manifest_batches, count_routgen_parameters)
+    from rbuild.model import CacheLoopLine, ParallelBundleStage
+
+    root = tempfile.mkdtemp(prefix="routgen_")
+    Image.new("RGB", (48, 48), (40, 40, 220)).save(os.path.join(root, "blue.png"))
+    wav_path = os.path.join(root, "tone.wav")
+    with wave.open(wav_path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        frames = b"".join(struct.pack("<h", int(10000 * math.sin(i / 8)))
+                          for i in range(16000))
+        w.writeframes(frames)
+    mpath = os.path.join(root, "manifest.json")
+    with open(mpath, "w") as f:
+        json.dump([{"text": "paint blue", "image_out": os.path.join(root, "blue.png")},
+                   {"text": "play tone", "audio_out": wav_path}], f)
+
+    cfg = RBuildConfig()
+    cfg.model.max_seq_len = 192
+    cfg.critic.max_loops = 2
+    o = cfg.outgen
+    o.enabled = True
+    o.image = o.video = o.tts = True
+    o.image_token_id, o.video_token_id, o.audio_token_id = 250, 251, 252
+    o.video_frames, o.audio_tokens = 2, 8
+
+    model = ROutGenModel(cfg)
+    n = sum(p.numel() for p in model.parameters())
+    counted = count_routgen_parameters(cfg)["total_params"]
+    check("routgen counter-verified", n == counted, f"{n:,} params")
+
+    text_model = RBuildModel(cfg)
+    check("routgen trunk IS the text architecture",
+          isinstance(model.cache_loop, CacheLoopLine)
+          and all(isinstance(s, ParallelBundleStage) for s in model.stages)
+          and model.cache_loop.critics is not None
+          and all(s.critics is not None for s in model.stages)
+          and not hasattr(model, "lm_head"),
+          "same CacheLoopLine + ParallelBundleStage + critic panels, no lm_head")
+    check("routgen drops only text-output params",
+          n == sum(p.numel() for p in text_model.parameters())
+               - sum(p.numel() for p in text_model.noting_experts.parameters()),
+          "trunk + memory + outgen identical to the text model (tied lm_head = 0)")
+    del text_model
+
+    hist = Trainer(model, cfg, device="cpu", log_fn=None).fit(
+        manifest_batches(mpath, cfg, batch=2, seq=192, shuffle=False),
+        max_steps=2)
+    check("routgen trains via stock Trainer", len(hist["loss"]) == 2,
+          f"loss {hist['loss'][-1]:.3f}")
+
+    model.zero_grad(set_to_none=True)
+    x, y, _, out_targets = next(iter(manifest_batches(
+        mpath, cfg, batch=2, seq=192, shuffle=False)))
+    _, loss = model(x, targets=y, out_targets=out_targets)
+    loss.backward()
+    g_head = any(p.grad is not None and p.grad.abs().sum() > 0
+                 for p in model.outgen.image_head.parameters())
+    g_trunk = any(p.grad is not None and p.grad.abs().sum() > 0
+                  for p in model.cache_loop.parameters())
+    check("routgen grads reach renderer MoE + trunk", g_head and g_trunk)
+
+    model.eval()
+    prompt = torch.tensor(list(b"make art"), dtype=torch.long).unsqueeze(0)
+    img = model.generate_image(prompt)
+    wav = model.generate_audio(prompt)
+    vid = model.generate_video(prompt)
+    check("routgen generate_image", img.shape == (1, 3, 48, 48)
+          and 0 <= float(img.min()) <= float(img.max()) <= 1)
+    check("routgen generate_audio", wav.shape == (1, cfg.out_audio_len())
+          and -1 <= float(wav.min()) <= float(wav.max()) <= 1)
+    check("routgen generate_video", vid.shape == (1, 2, 3, 48, 48)
+          and 0 <= float(vid.min()) <= float(vid.max()) <= 1)
+
+    ckpt = os.path.join(root, "ckpt")
+    model.save_checkpoint(ckpt)
+    reloaded = ROutGenModel.load_checkpoint(ckpt)
+    check("routgen checkpoint roundtrip",
+          isinstance(reloaded, ROutGenModel)
+          and reloaded.generate_image(prompt).shape == img.shape)
+
+
 if __name__ == "__main__":
     test_engine_swap()
     test_http_layer()
     test_rbuild_backend()
     test_vl_manifest_data()
     test_outgen_heads()
+    test_routgen_model()
     print(f"\nSMOKE TEST PASSED — {len(passed)} checks green")
