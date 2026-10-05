@@ -7,14 +7,20 @@ Universal JSON manifest (works with blind, ViT, and encoderless models):
       {"text": "any plain text"},
       {"text": "a caption for one picture", "images": ["pic.jpg"]},
       {"text": "several angles", "images": ["a.jpg", "https://.../b.png"]},
-      {"text": "describe the clip", "video": "clip.mp4"}
+      {"text": "describe the clip", "video": "clip.mp4"},
+      {"text": "paint a red square", "image_out": "red.png"},
+      {"text": "say hello", "audio_out": "hello.wav"},
+      {"text": "make it move", "video_out": "move.mp4"}
     ]
 
 Also accepts .jsonl (one object per line). Links can be local paths or
 http(s) URLs. Media is fetched, decoded, resized to `vision.image_size`,
 and spliced into the token stream as image-placeholder runs automatically
 — the manifest author never counts vision tokens. Blind models use the
-text and skip the media (with a one-time warning).
+text and skip the media (with a one-time warning). The *_out keys are the
+v3.1 generative targets (cfg.outgen): the model trains to PRODUCE that
+image / waveform / clip after the text — the same placeholder run
+model.generate_image / generate_audio / generate_video appends.
 
 HuggingFace streaming (needs: pip install .[train]):
 
@@ -90,6 +96,53 @@ def _uniform_indices(total: int, n: int) -> List[int]:
     if total <= n:
         return [min(i, total - 1) for i in range(n)]
     return [int(round(i * (total - 1) / (n - 1))) for i in range(n)]
+
+
+def load_audio(source: Any, n_samples: int, sample_rate: int = 16000) -> torch.Tensor:
+    """
+    One audio file -> (n_samples,) float waveform in [-1, 1] at sample_rate.
+    .wav via the stdlib; anything else via an ffmpeg subprocess. Shorter
+    clips are zero-padded, longer ones truncated; wrong sample rates are
+    linearly resampled.
+    """
+    raw = _read_bytes(source)
+    wav = sr = None
+    try:  # stdlib wave — no deps for plain .wav
+        import wave
+        with wave.open(io.BytesIO(raw)) as w:
+            sr = w.getframerate()
+            ch, sw = w.getnchannels(), w.getsampwidth()
+            frames = w.readframes(w.getnframes())
+        if sw == 2:
+            t = torch.frombuffer(bytearray(frames), dtype=torch.int16).float() / 32768.0
+        elif sw == 1:
+            t = torch.frombuffer(bytearray(frames), dtype=torch.uint8)
+            t = (t.float() - 128.0) / 128.0
+        else:  # 32-bit pcm
+            t = torch.frombuffer(bytearray(frames), dtype=torch.int32).float() / 2147483648.0
+        wav = t.view(-1, ch).mean(dim=1) if ch > 1 else t
+    except Exception:
+        wav = None
+    if wav is None:  # ffmpeg fallback — mp3/ogg/flac/whatever
+        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
+            tmp.write(raw)
+            tmp_path = tmp.name
+        try:
+            out = subprocess.run(
+                ["ffmpeg", "-v", "error", "-i", tmp_path, "-ac", "1", "-ar",
+                 str(sample_rate), "-f", "f32le", "-"],
+                capture_output=True, check=True)
+            wav = torch.frombuffer(bytearray(out.stdout), dtype=torch.float32).clone()
+            sr = sample_rate
+        finally:
+            os.unlink(tmp_path)
+    if sr != sample_rate:  # naive linear resample
+        n_new = max(1, int(round(wav.shape[0] * sample_rate / sr)))
+        wav = torch.nn.functional.interpolate(
+            wav.view(1, 1, -1), size=n_new, mode="linear", align_corners=False).view(-1)
+    if wav.shape[0] < n_samples:
+        wav = torch.cat([wav, torch.zeros(n_samples - wav.shape[0])])
+    return wav[:n_samples].clamp(-1.0, 1.0)
 
 
 def load_video(source: Any, n_frames: int, image_size: int) -> torch.Tensor:
@@ -187,21 +240,42 @@ def _encode_text(text: str, vocab_size: int) -> List[int]:
     return list(text.encode("utf-8"))
 
 
-def _build_sample(cfg, text: str, n_media: int, seq: int):
+def _out_runs(cfg, out_keys) -> List[int]:
+    """Placeholder ids a sample's out-targets need, appended after the text."""
+    o = cfg.outgen
+    ids: List[int] = []
+    if not (o.enabled and out_keys):
+        return ids
+    if o.image and "image" in out_keys:
+        ids += [o.image_token_id] * cfg.n_image_out_tokens()
+    if o.video and "video" in out_keys:
+        ids += [o.video_token_id] * cfg.n_video_out_tokens()
+    if o.tts and "audio" in out_keys:
+        ids += [o.audio_token_id] * o.audio_tokens
+    return ids
+
+
+def _build_sample(cfg, text: str, n_media: int, seq: int,
+                  out_keys: Optional[set] = None):
     """
     (input_ids, target_ids) for one sample: an <image>-placeholder run of the
-    exact length VisionTower will produce, followed by the byte-level text.
-    Padded to seq+1 with 0 / -100.
+    exact length VisionTower will produce, then the byte-level text, then the
+    out-placeholder runs for whichever generative heads this sample targets
+    (matching generate_image/video/audio, which append the same runs after
+    the prompt). Padded to seq+1 with 0 / -100; truncation never cuts any
+    placeholder run.
     """
     ids: List[int] = []
     if n_media > 0:
         ids += [cfg.vision.image_token_id] * vision_tokens_per_sample(cfg, n_media)
-    n_ph = len(ids)
-    if n_ph > seq + 1:
+    out_ids = _out_runs(cfg, out_keys)
+    n_reserved = len(ids) + len(out_ids)
+    if n_reserved > seq + 1:
         raise ValueError(
-            f"vision placeholders alone need {n_ph} tokens but seq={seq} — "
-            f"increase seq (or max_seq_len), shrink image_size / n_frames")
-    ids += _encode_text(text, cfg.model.vocab_size)[:seq + 1 - n_ph]
+            f"placeholders alone need {n_reserved} tokens but seq={seq} — "
+            f"increase seq (or max_seq_len), shrink image_size / n_frames / out sizes")
+    ids += _encode_text(text, cfg.model.vocab_size)[:seq + 1 - n_reserved]
+    ids += out_ids
     x = torch.zeros(seq + 1, dtype=torch.long)
     y = torch.full((seq + 1,), -100, dtype=torch.long)
     n = len(ids)
@@ -216,17 +290,22 @@ def _build_sample(cfg, text: str, n_media: int, seq: int):
 
 def _collate(cfg, samples, seq: int, warned: dict):
     """
-    samples: list of (text, frames_or_None). Frames are padded to the batch's
-    max frame count (last-frame repeat); text-only samples in a mixed batch
-    get black frames — standard mixed-modality padding, their loss is
-    unaffected (vision positions never enter the text loss).
+    samples: list of (text, frames_or_None, out_dict). Frames are padded to
+    the batch's max frame count (last-frame repeat); text-only samples in a
+    mixed batch get black frames — standard mixed-modality padding, their
+    loss is unaffected (vision positions never enter the text loss).
+    out_dict maps "image"/"video"/"audio" -> target media tensor; samples
+    missing a head's target get zero-filled targets and NO placeholder run,
+    so the head's loss skips them. Returns (x, y), (x, y, images), or
+    (x, y, images, out_targets) depending on what the config needs.
     """
     blind = not cfg.vision.enabled
-    has_media = any(f is not None for _, f in samples) and not blind
-    n_batch = max((f.shape[0] for _, f in samples if f is not None), default=0) \
+    has_media = any(f is not None for _, f, _ in samples) and not blind
+    n_batch = max((f.shape[0] for _, f, _ in samples if f is not None), default=0) \
         if has_media else 0
     xs, ys, vids = [], [], []
-    for text, frames in samples:
+    out_lists: Dict[str, list] = {}
+    for text, frames, outs in samples:
         if has_media:
             if frames is None:
                 frames = torch.zeros(n_batch, 3, cfg.vision.image_size,
@@ -234,20 +313,42 @@ def _collate(cfg, samples, seq: int, warned: dict):
             elif frames.shape[0] < n_batch:
                 pad = frames[-1:].expand(n_batch - frames.shape[0], -1, -1, -1)
                 frames = torch.cat([frames, pad], dim=0)
-            x, y = _build_sample(cfg, text, n_batch, seq)
+            x, y = _build_sample(cfg, text, n_batch, seq,
+                                 set(outs) if outs else None)
             vids.append(frames)
         else:
             if frames is not None and not warned.get("blind_media"):
                 print("  [data] blind model: media links in the manifest are "
                       "ignored — text only (enable vision to train on them)")
                 warned["blind_media"] = True
-            x, y = _build_sample(cfg, text, 0, seq)
+            x, y = _build_sample(cfg, text, 0, seq,
+                                 set(outs) if outs else None)
         xs.append(x)
         ys.append(y)
+        for key, t in (outs or {}).items():
+            out_lists.setdefault(key, []).append(t)
     x = torch.stack(xs)
     y = torch.stack(ys)
+    batch_out: Dict[str, torch.Tensor] = {}
+    if cfg.outgen.enabled and out_lists:
+        shapes = {"image": (3, cfg.outgen.image_size, cfg.outgen.image_size),
+                  "video": (cfg.outgen.video_frames, 3,
+                            cfg.outgen.image_size, cfg.outgen.image_size),
+                  "audio": (cfg.out_audio_len(),)}
+        B = len(samples)
+        for key, lst in out_lists.items():
+            t = torch.zeros(B, *shapes[key])
+            idx = [i for i, (_, _, outs) in enumerate(samples)
+                   if outs and key in outs]
+            for i, v in zip(idx, lst):
+                t[i] = v
+            batch_out[key] = t
+    if has_media and batch_out:
+        return x, y, torch.stack(vids), batch_out
     if has_media:
         return x, y, torch.stack(vids)
+    if batch_out:
+        return x, y, None, batch_out
     return x, y
 
 
@@ -274,7 +375,11 @@ def manifest_batches(path: str, cfg, batch: Optional[int] = None,
     """
     Batch generator over a JSON/JSONL manifest — the manual insert that works
     with every model type. Entries: {"text": ..., "images": [...], "video": ...}.
-    Yields (x, y) for blind configs, (x, y, images) for vision configs.
+    v3.1 outgen entries add generation targets: "image_out": <pic>,
+    "video_out": <clip>, "audio_out": <sound> — the model learns to PRODUCE
+    that media after the text (same run generate_image/video/audio uses).
+    Yields (x, y) for blind text configs, (x, y, images) for vision
+    configs, (x, y, images, out_targets) when outgen targets are present.
     Media that fails to load is skipped with a warning.
     """
     batch = batch or cfg.train.batch_size
@@ -286,24 +391,44 @@ def manifest_batches(path: str, cfg, batch: Optional[int] = None,
     _SKIP = object()
 
     def frames_for(entry):
+        outs = None
+        if cfg.outgen.enabled:
+            outs = {}
+            try:
+                o = cfg.outgen
+                if o.image and entry.get("image_out"):
+                    outs["image"] = load_image(entry["image_out"], o.image_size)
+                if o.video and entry.get("video_out"):
+                    outs["video"] = load_video(entry["video_out"],
+                                               o.video_frames, o.image_size)
+                if o.tts and entry.get("audio_out"):
+                    outs["audio"] = load_audio(entry["audio_out"],
+                                               cfg.out_audio_len(), o.sample_rate)
+            except Exception as e:
+                if not warned.get("out_load_fail"):
+                    print(f"  [data] skipping entries whose out-target media "
+                          f"fails to load ({e})")
+                    warned["out_load_fail"] = True
+                return _SKIP
         if not cfg.vision.enabled:
             if (entry.get("images") or entry.get("video")) and not warned.get("blind_media"):
                 print("  [data] blind model: media links in the manifest are "
                       "ignored — text only (enable vision to train on them)")
                 warned["blind_media"] = True
-            return None
+            return None, outs
         try:
             if entry.get("video"):
-                return load_video(entry["video"], n_frames, cfg.vision.image_size)
+                return load_video(entry["video"], n_frames,
+                                  cfg.vision.image_size), outs
             if entry.get("images"):
                 imgs = [load_image(s, cfg.vision.image_size) for s in entry["images"]]
-                return torch.stack(imgs)
+                return torch.stack(imgs), outs
         except Exception as e:
             if not warned.get("load_fail"):
                 print(f"  [data] skipping entries whose media fails to load ({e})")
                 warned["load_fail"] = True
             return _SKIP
-        return None
+        return None, outs
 
     while True:
         order = list(range(len(entries)))
@@ -313,10 +438,11 @@ def manifest_batches(path: str, cfg, batch: Optional[int] = None,
         for i in order:
             entry = entries[i]
             text = entry.get("text", "")
-            fr = frames_for(entry)
-            if fr is _SKIP:
+            got = frames_for(entry)
+            if got is _SKIP:
                 continue
-            samples.append((text, fr))
+            fr, outs = got
+            samples.append((text, fr, outs))
             if len(samples) == batch:
                 yield _collate(cfg, samples, seq, warned)
                 samples = []
@@ -402,7 +528,7 @@ def hf_image_batches(dataset_name: str, cfg, batch: Optional[int] = None,
                 img = _pil_to_tensor(img, cfg.vision.image_size)
             else:                                    # path/URL/bytes -> tensor
                 img = load_image(img, cfg.vision.image_size)
-            samples.append((str(row[t_col]), img.unsqueeze(0)))
+            samples.append((str(row[t_col]), img.unsqueeze(0), None))
         except Exception as e:
             if not warned.get("load_fail"):
                 print(f"  [data] skipping rows whose image fails ({e})")
@@ -449,7 +575,7 @@ def hf_video_batches(dataset_name: str, cfg, batch: Optional[int] = None,
                   f"({n_frames} frames/clip)")
         try:
             frames = load_video(row[v_col], n_frames, cfg.vision.image_size)
-            samples.append((str(row[t_col]), frames))
+            samples.append((str(row[t_col]), frames, None))
         except Exception as e:
             if not warned.get("load_fail"):
                 print(f"  [data] skipping rows whose video fails ({e})")

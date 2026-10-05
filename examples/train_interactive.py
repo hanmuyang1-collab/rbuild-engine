@@ -14,7 +14,7 @@ answer is validated, and invalid input is re-asked with an explanation.
     2. critic experts + ACT halting      7. training knobs
     3. noting + self-training            8. data source
     4. thinking mode                     9. review + train
-    5. vision (blind / ViT / encoderless) 10. save (+ optional HF push)
+    5. vision + v3.1 OUTPUT heads        10. save (+ optional HF push)
 
 Don't want prompts? Edit the ANSWERS dict right below this docstring — any
 key you fill in is used instead of asking (set AUTO = True to skip ALL
@@ -45,6 +45,7 @@ ANSWERS = {
     "thinking_mode": None,        # "fast"|"balanced"|"deep"|"careful"|"research"|"custom"
     "vision": None,               # "blind" | "vit" | "encoderless"
     "vawu": None,                 # True/False (whole-video tokens)
+    "outgen": None,               # "none" | "image" | "tts" | "video" | "all" (v3.1 OUT heads)
     "actuation": None,            # True/False (native action tokens)
     "steps": None,                # training steps (int)
     "batch_size": None,           # sequences per step (int)
@@ -156,15 +157,20 @@ def hf_batches(tokenizer_name, dataset_name, vocab_size, batch, seq):
 # --------------------------------------------------------------------- #
 
 def _fit_seq_for_vision(cfg, n_frames: int = 8):
-    """Vision placeholders must fit in the context — bump seq if needed."""
-    if not cfg.vision.enabled:
-        return
-    from rbuild import vision_tokens_per_sample
-    n_frames = min(n_frames, cfg.vision.max_video_frames)
-    need = vision_tokens_per_sample(cfg, n_frames) + 32   # + room for text
+    """Placeholder runs must fit in the context — bump seq if needed."""
+    need = 32                                            # room for text
+    if cfg.vision.enabled:
+        from rbuild import vision_tokens_per_sample
+        n_frames = min(n_frames, cfg.vision.max_video_frames)
+        need += vision_tokens_per_sample(cfg, n_frames)
+    if cfg.outgen.enabled:                               # worst-case out run
+        o = cfg.outgen
+        need += (cfg.n_image_out_tokens() if o.image else 0) \
+              + (cfg.n_video_out_tokens() if o.video else 0) \
+              + (o.audio_tokens if o.tts else 0)
     if cfg.model.max_seq_len < need:
         print(f"      note: context length {cfg.model.max_seq_len} can't hold "
-              f"{n_frames} frame(s) of vision tokens — raising to {need}")
+              f"the placeholder runs — raising to {need}")
         cfg.model.max_seq_len = need
 
 
@@ -238,6 +244,31 @@ def main():
                       f"vit_dim {vd} — using {h}")
                 cfg.vision.vit_heads = h
 
+    # ---- 5b. output heads (v3.1: TTS / image OUT / video OUT) ---------- #
+    print("\nSTEP 5b — generative OUTPUT heads (the model produces media)")
+    out_kind = ask("outgen", "output heads", "none",
+                   choices=["none", "image", "tts", "video", "all"],
+                   hint="decoderless OUT — paint images / speak (TTS) / render clips; "
+                        "each head is a routed renderer MoE; train with the *_out "
+                        "manifest keys in step 8 (json)")
+    if out_kind != "none":
+        o = cfg.outgen
+        o.enabled = True
+        o.image = out_kind in ("image", "all")
+        o.tts = out_kind in ("tts", "all")
+        o.video = out_kind in ("video", "all")
+        if name == "tiny":                    # keep CPU runs small
+            o.image_size, o.image_patch = 48, 8
+            o.video_frames, o.audio_tokens = 2, 8
+        used = {cfg.vision.image_token_id} if cfg.vision.enabled else set()
+        nxt = cfg.effective_vocab_size() - 1
+        for head, on in (("image", o.image), ("video", o.video), ("audio", o.tts)):
+            if on:
+                while nxt in used:
+                    nxt -= 1
+                setattr(o, f"{head}_token_id", nxt)
+                used.add(nxt)
+
     # ---- 6. actuation -------------------------------------------------- #
     print("\nSTEP 6 — native actuation (model clicks by generating tokens)")
     cfg.actuation.enabled = ask_bool("actuation", "enable action tokens", False,
@@ -281,8 +312,9 @@ def main():
         from rbuild import load_manifest, manifest_batches
         path = ask("json_path", "path to manifest (.json or .jsonl)", "data.json",
                    hint='[{"text": "a cat", "images": ["cat.jpg"]}, '
-                        '{"text": "a clip", "video": "clip.mp4"}, ...] — '
-                        "paths or https links; works blind too (media ignored)")
+                        '{"text": "paint a cat", "image_out": "cat.png"}, '
+                        '{"text": "say hi", "audio_out": "hi.wav"}, ...] — '
+                        "paths or https links; *_out keys teach the OUT heads")
         while not os.path.exists(path):
             path = ask("json_path", "not found — path to manifest", "data.json")
         has_video = any(e.get("video") for e in load_manifest(path))

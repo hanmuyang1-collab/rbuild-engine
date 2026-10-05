@@ -41,10 +41,12 @@ model click natively.
 from .config import (RBuildConfig, ModelConfig, CacheLoopConfig,
                      ParallelConfig, CriticConfig, NotingConfig,
                      ThinkingConfig, ActuationConfig, WatermarkConfig,
-                     MemoryConfig, VisionConfig, TrainConfig, preset)
+                     MemoryConfig, VisionConfig, OutGenConfig,
+                     TrainConfig, preset)
 from .model import RBuildModel, CacheLoopLine, ParallelBundleStage
 from .memory import FastWeightMemory
 from .vision import VisionTower, VaWUPooler
+from .outgen import OutGen, RendererMoE, ImageOutHead, VideoOutHead, TTSOutHead
 from .critics import CriticExpert, CriticPanel, ACTHalting
 from .noting import NotingExperts, VerifiedNoteBuffer, SelfLearner
 from .thinking import ThinkingModes
@@ -52,7 +54,7 @@ from .actuation import ActionCodec, ActuationHead, Action
 from .watermark import GreenListWatermark, WatermarkDetector
 from .optim import Muon, WSDScheduler, build_optimizer
 from .data import (load_manifest, manifest_batches, hf_image_batches,
-                   hf_video_batches, load_image, load_video,
+                   hf_video_batches, load_image, load_video, load_audio,
                    vision_tokens_per_sample)
 from .train import Trainer
 from . import interactive
@@ -62,14 +64,17 @@ __version__ = "3.1.0"
 __all__ = [
     "RBuildConfig", "ModelConfig", "CacheLoopConfig", "ParallelConfig",
     "CriticConfig", "NotingConfig", "ThinkingConfig", "ActuationConfig",
-    "WatermarkConfig", "MemoryConfig", "VisionConfig", "TrainConfig", "preset",
+    "WatermarkConfig", "MemoryConfig", "VisionConfig", "OutGenConfig",
+    "TrainConfig", "preset",
     "RBuildModel", "CacheLoopLine", "ParallelBundleStage",
     "FastWeightMemory", "VisionTower", "VaWUPooler",
+    "OutGen", "RendererMoE", "ImageOutHead", "VideoOutHead", "TTSOutHead",
     "CriticExpert", "CriticPanel", "ACTHalting",
     "NotingExperts", "VerifiedNoteBuffer", "SelfLearner",
     "ThinkingModes", "ActionCodec", "ActuationHead", "Action",
     "GreenListWatermark", "WatermarkDetector",
     "Muon", "WSDScheduler", "build_optimizer", "Trainer", "interactive",
     "load_manifest", "manifest_batches", "hf_image_batches",
-    "hf_video_batches", "load_image", "load_video", "vision_tokens_per_sample",
+    "hf_video_batches", "load_image", "load_video", "load_audio",
+    "vision_tokens_per_sample",
 ]

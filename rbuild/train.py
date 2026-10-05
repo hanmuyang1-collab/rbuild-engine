@@ -89,8 +89,10 @@ class Trainer:
         """
         batches: iterable yielding (input_ids, targets) LongTensors of shape
         (B, T) — or (input_ids, targets, images) with images (B, N, C, H, W)
-        for vision training (see rbuild.data). Re-loops the iterable if it
-        is shorter than max_steps.
+        for vision training, or (input_ids, targets, images, out_targets)
+        with a {"image"|"video"|"audio": tensor} dict for the v3.1
+        generative output heads (see rbuild.data). Re-loops the iterable
+        if it is shorter than max_steps.
         save_every > 0 writes a checkpoint to save_dir every N steps.
         If train.self_train_every > 0, verified self-observed notes are
         consolidated into the slow weights every N steps.
@@ -106,17 +108,25 @@ class Trainer:
             except StopIteration:
                 data_iter = iter(batches)
                 batch = next(data_iter)
-            if len(batch) == 3:
+            if len(batch) == 4:
+                x, y, images, out_targets = batch
+                if images is not None:
+                    images = images.to(self.device)
+                out_targets = {k: v.to(self.device) for k, v in out_targets.items()}
+            elif len(batch) == 3:
                 x, y, images = batch
                 images = images.to(self.device)
+                out_targets = None
             else:
                 x, y = batch
                 images = None
+                out_targets = None
             x, y = x.to(self.device), y.to(self.device)
 
             lr_f = self.sched.set(step)
             with _autocast_ctx(cfg.train.precision, self.device_type):
-                _, loss = self.model(x, targets=y, images=images)
+                _, loss = self.model(x, targets=y, images=images,
+                                     out_targets=out_targets)
                 loss = loss / cfg.train.grad_accum
             loss.backward()
             accum += 1
