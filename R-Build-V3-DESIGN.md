@@ -132,15 +132,65 @@ adaptive machinery without rebuilding the model:
 model.thinking_mode.deep()        # built-in
 model.thinking_mode.deep(12)      # positional value = max_loops override
 model.thinking_mode.create("exam", max_loops=10, y_critics=3,
-                           halt_threshold=0.9, temperature=0.2)
+                           halt_threshold=0.9, temperature=0.2,
+                           effort=1.5, reasoning=True)
 model.thinking_mode.exam()        # user modes are first-class
 ```
 
 Mode knobs: `max_loops`, `y_critics`, `halt_threshold`, `temperature`,
-`top_p`, `self_observe`.
-Built-ins: `fast` (2 loops, no observation) · `balanced` · `deep` ·
-`careful` · `research` (24 loops, strictest gate).
+`top_p`, `self_observe`, plus the v3.2 pair **`effort`** and
+**`reasoning`**.
+Built-ins: `instant` (reasoning off) · `fast` · `balanced` · `deep` ·
+`careful` · `research`.
 Custom modes persist into checkpoints via `thinking.custom_modes`.
+
+### 4.1 Effort & reasoning (v3.2)
+
+Every mode definition carries two extra fields:
+
+- **`effort` (float)** — the mode's *built-in reasoning effort*: how much
+  thinking the mode was designed for (`fast` 0.5, `balanced` 1.0, `deep`
+  2.0, `careful` 2.5, `research` 4.0). It is **invisible** — never typed
+  by end users, only read from the mode definition.
+- **`reasoning` (bool)** — the chain-of-thought switch. `False` means
+  **instant, no thinking**: the extraction loop is capped at
+  `critic.min_loops`, no critic consensus is awaited, sampling knobs are
+  taken as-is, and the effective effort is 0. The built-in `instant`
+  mode is exactly this.
+
+The **selectable effort** is a separate, built-in ladder of named
+multipliers — `low` ×0.5, `medium` ×1.0, `high` ×2.0 (extendable via
+`thinking.selectable_efforts`) — that, unlike the invisible reasoning
+effort, the *caller* picks **by tag**:
+
+```
+effective effort = mode's built-in effort × selectable multiplier
+```
+
+Three ways to pick the tag: inline in the prompt text
+(`"explain this {effort:'high'}"`, parsed by `parse_effort_tag` and the
+interactive chat), per call (`generate(..., effort="high")`, also on
+`generate_image/video/audio`), or persistently
+(`thinking_mode.set_effort("low")`, `/effort low` in chat).
+
+**Effort is real compute, not a label.** The selectable multiplier s
+re-derives the active mode's runtime knobs relative to its design point
+(medium = ×1.0 = exactly the declared knobs):
+
+- extraction-loop cap: `round(max_loops × s)` — deeper thinking;
+- critic consensus: `round(y_critics × s)` (clamped to the panel size);
+- halt threshold: `1 − (1 − threshold)^s` — saturates toward 1, a
+  strictly stricter gate;
+- temperature: `temperature / √s` — sharper, higher-quality sampling.
+
+So `high` on any mode literally runs more extraction loops under a
+stricter critic gate with sharper sampling, and `low` does the opposite;
+the smoke suite verifies the loop actually runs deeper (6 → 12 → 24
+loops for `deep` across low/medium/high with unsatisfiable critics).
+Everything is runtime-only: **zero parameters**, checkpoints and the
+counter are untouched, and old modes without the new fields default to
+`effort=1.0, reasoning=True` — identical behavior at `medium`.
+
 
 ## 5. Vision: ViT, encoderless, VaWU
 
