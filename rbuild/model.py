@@ -42,6 +42,7 @@ actuation/vision disabled the architecture is bit-identical to v2.
 
 from __future__ import annotations
 
+import contextlib
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
@@ -302,6 +303,10 @@ class RBuildModel(nn.Module):
         self._runtime_sampling: Optional[dict] = None
         self._runtime_self_observe: bool = cfg.noting.enabled and cfg.noting.nsct
         self._active_thinking_mode: Optional[str] = None
+        # v3.2: reasoning switch + effective effort (built-in x selectable)
+        self._runtime_reasoning: bool = True
+        self._runtime_effort: float = 1.0
+        self._runtime_effort_tag: Optional[str] = cfg.thinking.default_effort
         self._watermarker_obj = None
         self.thinking_mode = ThinkingModes(self)
         if cfg.critic.enabled and cfg.thinking.default_mode:
@@ -519,6 +524,22 @@ class RBuildModel(nn.Module):
         return self._watermarker_obj
 
     # ------------------------------------------------------------------ #
+    # v3.2: selectable effort — per-call override, restored afterwards
+    # ------------------------------------------------------------------ #
+    @contextlib.contextmanager
+    def _temporary_effort(self, effort: Optional[str]):
+        """generate(..., effort="high"): apply the tag, restore after."""
+        if effort is None:
+            yield
+            return
+        prev = self.thinking_mode.current_effort()
+        self.thinking_mode.set_effort(effort)
+        try:
+            yield
+        finally:
+            self.thinking_mode.set_effort(prev)
+
+    # ------------------------------------------------------------------ #
     # v3.1: media generation through the outgen heads
     # ------------------------------------------------------------------ #
     def _media_prompt(self, prompt_ids: torch.Tensor, token_id: int,
@@ -533,33 +554,40 @@ class RBuildModel(nn.Module):
         return x[:, -n_tokens:]
 
     @torch.no_grad()
-    def generate_image(self, prompt_ids: torch.Tensor) -> torch.Tensor:
-        """Text/vision prompt -> image tensor (B, 3, S, S) in [0, 1]."""
+    def generate_image(self, prompt_ids: torch.Tensor,
+                       effort: Optional[str] = None) -> torch.Tensor:
+        """Text/vision prompt -> image tensor (B, 3, S, S) in [0, 1].
+        effort= selects a selectable-effort tag for this call only."""
         assert self.outgen is not None and self.outgen.image_head is not None, \
             "generate_image needs outgen.enabled=True and outgen.image=True"
         self.eval()
-        h = self._media_prompt(prompt_ids, self.cfg.outgen.image_token_id,
-                               self.cfg.n_image_out_tokens())
+        with self._temporary_effort(effort):
+            h = self._media_prompt(prompt_ids, self.cfg.outgen.image_token_id,
+                                   self.cfg.n_image_out_tokens())
         return self.outgen.decode_image(h)
 
     @torch.no_grad()
-    def generate_video(self, prompt_ids: torch.Tensor) -> torch.Tensor:
+    def generate_video(self, prompt_ids: torch.Tensor,
+                       effort: Optional[str] = None) -> torch.Tensor:
         """Text/vision prompt -> clip tensor (B, F, 3, S, S) in [0, 1]."""
         assert self.outgen is not None and self.outgen.video_head is not None, \
             "generate_video needs outgen.enabled=True and outgen.video=True"
         self.eval()
-        h = self._media_prompt(prompt_ids, self.cfg.outgen.video_token_id,
-                               self.cfg.n_video_out_tokens())
+        with self._temporary_effort(effort):
+            h = self._media_prompt(prompt_ids, self.cfg.outgen.video_token_id,
+                                   self.cfg.n_video_out_tokens())
         return self.outgen.decode_video(h)
 
     @torch.no_grad()
-    def generate_audio(self, prompt_ids: torch.Tensor) -> torch.Tensor:
+    def generate_audio(self, prompt_ids: torch.Tensor,
+                       effort: Optional[str] = None) -> torch.Tensor:
         """Text prompt -> waveform (B, L) in [-1, 1] at cfg.outgen.sample_rate."""
         assert self.outgen is not None and self.outgen.tts_head is not None, \
             "generate_audio needs outgen.enabled=True and outgen.tts=True"
         self.eval()
-        h = self._media_prompt(prompt_ids, self.cfg.outgen.audio_token_id,
-                               self.cfg.outgen.audio_tokens)
+        with self._temporary_effort(effort):
+            h = self._media_prompt(prompt_ids, self.cfg.outgen.audio_token_id,
+                                   self.cfg.outgen.audio_tokens)
         return self.outgen.decode_audio(h)
 
     @torch.no_grad()
@@ -567,34 +595,38 @@ class RBuildModel(nn.Module):
                  temperature: Optional[float] = None, top_p: Optional[float] = None,
                  top_k: int = 0, eos_id: Optional[int] = None,
                  images: Optional[torch.Tensor] = None,
-                 watermark: Optional[bool] = None) -> torch.Tensor:        # thinking modes set the sampling defaults
-        rt = self._runtime_sampling or {}
-        temperature = temperature if temperature is not None else rt.get("temperature", 1.0)
-        top_p = top_p if top_p is not None else rt.get("top_p", 0.9)
-        wm = self.cfg.watermark.enabled if watermark is None else watermark
-        self.eval()
-        out = input_ids
-        for _ in range(max_new_tokens):
-            window = out[:, -self.cfg.model.max_seq_len:]
-            logits, _ = self(window, images=images)
-            nxt_logits = logits[:, -1, :].float() / max(1e-6, temperature)
-            if wm:                                            # v3: watermark bias
-                nxt_logits = self._watermarker().bias_logits(nxt_logits, out[:, -1])
-            if top_k > 0:
-                v, _ = torch.topk(nxt_logits, min(top_k, nxt_logits.shape[-1]))
-                nxt_logits[nxt_logits < v[:, [-1]]] = -float("inf")
-            if 0 < top_p < 1.0:
-                sorted_logits, sorted_idx = torch.sort(nxt_logits, descending=True)
-                cum = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                remove = cum > top_p
-                remove[..., 1:] = remove[..., :-1].clone()
-                remove[..., 0] = False
-                nxt_logits.scatter_(1, sorted_idx, sorted_logits.masked_fill(remove, -float("inf")))
-            probs = F.softmax(nxt_logits, dim=-1)
-            nxt = torch.multinomial(probs, 1)
-            out = torch.cat([out, nxt], dim=1)
-            if eos_id is not None and (nxt == eos_id).all():
-                break
+                 watermark: Optional[bool] = None,
+                 effort: Optional[str] = None) -> torch.Tensor:
+        # thinking modes set the sampling defaults; effort= picks a
+        # selectable-effort tag ("low"/"medium"/"high"/...) for this call
+        with self._temporary_effort(effort):
+            rt = self._runtime_sampling or {}
+            temperature = temperature if temperature is not None else rt.get("temperature", 1.0)
+            top_p = top_p if top_p is not None else rt.get("top_p", 0.9)
+            wm = self.cfg.watermark.enabled if watermark is None else watermark
+            self.eval()
+            out = input_ids
+            for _ in range(max_new_tokens):
+                window = out[:, -self.cfg.model.max_seq_len:]
+                logits, _ = self(window, images=images)
+                nxt_logits = logits[:, -1, :].float() / max(1e-6, temperature)
+                if wm:                                            # v3: watermark bias
+                    nxt_logits = self._watermarker().bias_logits(nxt_logits, out[:, -1])
+                if top_k > 0:
+                    v, _ = torch.topk(nxt_logits, min(top_k, nxt_logits.shape[-1]))
+                    nxt_logits[nxt_logits < v[:, [-1]]] = -float("inf")
+                if 0 < top_p < 1.0:
+                    sorted_logits, sorted_idx = torch.sort(nxt_logits, descending=True)
+                    cum = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    remove = cum > top_p
+                    remove[..., 1:] = remove[..., :-1].clone()
+                    remove[..., 0] = False
+                    nxt_logits.scatter_(1, sorted_idx, sorted_logits.masked_fill(remove, -float("inf")))
+                probs = F.softmax(nxt_logits, dim=-1)
+                nxt = torch.multinomial(probs, 1)
+                out = torch.cat([out, nxt], dim=1)
+                if eos_id is not None and (nxt == eos_id).all():
+                    break
         return out
 
     # ------------------------------------------------------------------ #
