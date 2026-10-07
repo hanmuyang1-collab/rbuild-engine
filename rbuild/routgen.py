@@ -45,6 +45,7 @@ is no text CE), and checkpoints keep the same format
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from typing import Dict, List, Optional, Tuple
@@ -143,6 +144,10 @@ class ROutGenModel(nn.Module):
         self._runtime_y_critics: Optional[int] = None
         self._runtime_sampling: Optional[dict] = None
         self._active_thinking_mode: Optional[str] = None
+        # v3.2: reasoning switch + effective effort (built-in x selectable)
+        self._runtime_reasoning: bool = True
+        self._runtime_effort: float = 1.0
+        self._runtime_effort_tag: Optional[str] = cfg.thinking.default_effort
         self.thinking_mode = ThinkingModes(self)
         if cfg.critic.enabled and cfg.thinking.default_mode:
             try:
@@ -252,6 +257,19 @@ class ROutGenModel(nn.Module):
     # ------------------------------------------------------------------ #
     # generation: prompt + one placeholder run -> encode once -> decode
     # ------------------------------------------------------------------ #
+    @contextlib.contextmanager
+    def _temporary_effort(self, effort: Optional[str]):
+        """generate_*(..., effort="high"): apply the tag, restore after."""
+        if effort is None:
+            yield
+            return
+        prev = self.thinking_mode.current_effort()
+        self.thinking_mode.set_effort(effort)
+        try:
+            yield
+        finally:
+            self.thinking_mode.set_effort(prev)
+
     def _media_prompt(self, prompt_ids: torch.Tensor, token_id: int,
                       n_tokens: int) -> torch.Tensor:
         pad = torch.full((prompt_ids.shape[0], n_tokens), token_id,
@@ -263,33 +281,40 @@ class ROutGenModel(nn.Module):
         return x[:, -n_tokens:]
 
     @torch.no_grad()
-    def generate_image(self, prompt_ids: torch.Tensor) -> torch.Tensor:
-        """Prompt -> image tensor (B, 3, S, S) in [0, 1]."""
+    def generate_image(self, prompt_ids: torch.Tensor,
+                       effort: Optional[str] = None) -> torch.Tensor:
+        """Prompt -> image tensor (B, 3, S, S) in [0, 1].
+        effort= selects a selectable-effort tag for this call only."""
         assert self.outgen.image_head is not None, \
             "generate_image needs outgen.image=True"
         self.eval()
-        h = self._media_prompt(prompt_ids, self.cfg.outgen.image_token_id,
-                               self.cfg.n_image_out_tokens())
+        with self._temporary_effort(effort):
+            h = self._media_prompt(prompt_ids, self.cfg.outgen.image_token_id,
+                                   self.cfg.n_image_out_tokens())
         return self.outgen.decode_image(h)
 
     @torch.no_grad()
-    def generate_video(self, prompt_ids: torch.Tensor) -> torch.Tensor:
+    def generate_video(self, prompt_ids: torch.Tensor,
+                       effort: Optional[str] = None) -> torch.Tensor:
         """Prompt -> clip tensor (B, F, 3, S, S) in [0, 1]."""
         assert self.outgen.video_head is not None, \
             "generate_video needs outgen.video=True"
         self.eval()
-        h = self._media_prompt(prompt_ids, self.cfg.outgen.video_token_id,
-                               self.cfg.n_video_out_tokens())
+        with self._temporary_effort(effort):
+            h = self._media_prompt(prompt_ids, self.cfg.outgen.video_token_id,
+                                   self.cfg.n_video_out_tokens())
         return self.outgen.decode_video(h)
 
     @torch.no_grad()
-    def generate_audio(self, prompt_ids: torch.Tensor) -> torch.Tensor:
+    def generate_audio(self, prompt_ids: torch.Tensor,
+                       effort: Optional[str] = None) -> torch.Tensor:
         """Prompt -> waveform (B, L) in [-1, 1] at cfg.outgen.sample_rate."""
         assert self.outgen.tts_head is not None, \
             "generate_audio needs outgen.tts=True"
         self.eval()
-        h = self._media_prompt(prompt_ids, self.cfg.outgen.audio_token_id,
-                               self.cfg.outgen.audio_tokens)
+        with self._temporary_effort(effort):
+            h = self._media_prompt(prompt_ids, self.cfg.outgen.audio_token_id,
+                                   self.cfg.outgen.audio_tokens)
         return self.outgen.decode_audio(h)
 
     # ------------------------------------------------------------------ #
