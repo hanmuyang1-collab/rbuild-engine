@@ -42,7 +42,7 @@ ANSWERS = {
     "max_loops": None,            # extraction-loop cap (int)
     "noting": None,               # True/False (critic-verified self-training)
     "nsct": None,                 # True/False (train+run simultaneously, low RAM; default OFF)
-    "thinking_mode": None,        # "fast"|"balanced"|"deep"|"careful"|"research"|"custom"
+    "thinking_mode": None,        # "instant"|"fast"|"balanced"|"deep"|"careful"|"research"|"custom"
     "vision": None,               # "blind" | "vit" | "encoderless"
     "vawu": None,                 # True/False (whole-video tokens)
     "outgen": None,               # "none" | "image" | "tts" | "video" | "all" (v3.1 OUT heads)
@@ -223,8 +223,9 @@ def main():
     print("\nSTEP 4 — thinking mode (retunes loops/critics/sampling live)")
     cfg.thinking.default_mode = ask(
         "thinking_mode", "mode", "balanced",
-        choices=["fast", "balanced", "deep", "careful", "research"],
-        hint="fast = 2 loops; research = 24 loops + strictest critics")
+        choices=["instant", "fast", "balanced", "deep", "careful", "research"],
+        hint="instant = reasoning off, no thinking; fast = 2 loops; "
+             "research = 24 loops + strictest critics")
 
     # ---- 5. vision ----------------------------------------------------- #
     print("\nSTEP 5 — vision (training below stays text; this shapes the model)")
