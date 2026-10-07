@@ -447,6 +447,116 @@ def test_routgen_model():
           and reloaded.generate_image(prompt).shape == img.shape)
 
 
+def test_thinking_effort():
+    """v3.2: mode effort (float) + reasoning flag + tag-selected effort."""
+    print("== thinking effort (reasoning flag + selectable effort) ==")
+    import torch
+    from rbuild import RBuildConfig, RBuildModel, parse_effort_tag
+    from rbuild.thinking import BUILTIN_MODES
+
+    # every built-in mode defines effort (float) + reasoning (bool)
+    check("modes define effort + reasoning",
+          all(isinstance(m.get("effort"), float)
+              and isinstance(m.get("reasoning"), bool)
+              for m in BUILTIN_MODES.values()))
+    check("instant mode = reasoning off",
+          BUILTIN_MODES["instant"]["reasoning"] is False
+          and BUILTIN_MODES["instant"]["effort"] == 0.0)
+
+    # selectable effort is picked by tag, unlike the invisible mode effort
+    clean, tag = parse_effort_tag("paint a cat {effort:'high'}")
+    check("effort tag parsed", clean == "paint a cat" and tag == "high",
+          f"{clean!r} / {tag!r}")
+    clean2, tag2 = parse_effort_tag("no tag here")
+    check("no tag -> None", tag2 is None and clean2 == "no tag here")
+
+    cfg = RBuildConfig()
+    cfg.model.max_seq_len = 32
+    cfg.critic.max_loops = 8
+    cfg.critic.min_loops = 1
+    model = RBuildModel(cfg)
+    check("effort adds zero parameters (counter still exact)",
+          sum(p.numel() for p in model.parameters())
+          == cfg.count_parameters()["total_params"])
+
+    # the ladder is built in; default tag is medium
+    check("selectable ladder built in",
+          model.thinking_mode.selectable_efforts
+          == {"low": 0.5, "medium": 1.0, "high": 2.0})
+    check("default effort tag", model.thinking_mode.current_effort() == "medium")
+
+    # effective effort = mode's built-in (invisible) effort x selectable
+    model.thinking_mode.deep()
+    model.thinking_mode.set_effort("high")
+    check("effective = built-in x selectable",
+          abs(model.thinking_mode.effective_effort() - 2.0 * 2.0) < 1e-9,
+          f"deep(2.0) x high(2.0) = {model.thinking_mode.effective_effort():g}")
+
+    # selectable effort ACTUALLY increases depth: with critics that never
+    # fire, the loop runs to its cap — and the cap scales with the tag
+    class _NeverSatisfied(torch.nn.Module):
+        threshold = 0.99
+
+        def forward(self, x):
+            z = torch.zeros(x.shape[0], x.shape[1], device=x.device)
+            return z, z.long()
+
+    model.cache_loop.critics = _NeverSatisfied()
+    model.eval()
+    x = torch.randint(0, 256, (1, 16))
+    loops, thresholds, temps = {}, {}, {}
+    for t in ("low", "medium", "high"):
+        model.thinking_mode.set_effort(t)
+        with torch.no_grad():
+            model.hidden_states(x)
+        loops[t] = model.cache_loop.last_halting["mean_loops"]
+        thresholds[t] = model.cache_loop.critics.threshold
+        temps[t] = model._runtime_sampling["temperature"]
+    check("more effort = deeper extraction (actual loops)",
+          loops["low"] < loops["medium"] < loops["high"], str(loops))
+    check("more effort = stricter critic gate",
+          thresholds["low"] < thresholds["medium"] < thresholds["high"],
+          str({k: round(v, 3) for k, v in thresholds.items()}))
+    check("more effort = sharper sampling",
+          temps["high"] < temps["medium"] < temps["low"],
+          str({k: round(v, 3) for k, v in temps.items()}))
+
+    # reasoning=False = instant, no thinking: minimum loops, zero effort
+    model.thinking_mode.instant()
+    with torch.no_grad():
+        model.hidden_states(x)
+    check("reasoning off = instant (min loops, zero effort)",
+          model.cache_loop.last_halting["mean_loops"] == cfg.critic.min_loops
+          and model.thinking_mode.effective_effort() == 0.0)
+
+    # per-call effort kwarg applies once and restores the previous tag
+    model.thinking_mode.balanced()
+    model.thinking_mode.set_effort("medium")
+    model.generate(x, max_new_tokens=2, effort="high")
+    check("generate(effort=...) is per-call",
+          model.thinking_mode.current_effort() == "medium")
+
+    # unknown tags are rejected loudly
+    try:
+        model.thinking_mode.set_effort("ludicrous")
+        rejected = False
+    except KeyError:
+        rejected = True
+    check("unknown effort tag rejected", rejected)
+
+    # create() accepts the new knobs and still rejects unknown ones
+    m = model.thinking_mode.create("exam", max_loops=10, effort=1.5,
+                                   reasoning=True)
+    check("custom mode carries effort + reasoning",
+          m["effort"] == 1.5 and m["reasoning"] is True)
+    try:
+        model.thinking_mode.create("bogus", speed=2)
+        rejected = False
+    except ValueError:
+        rejected = True
+    check("unknown mode knob still rejected", rejected)
+
+
 if __name__ == "__main__":
     test_engine_swap()
     test_http_layer()
@@ -454,4 +564,5 @@ if __name__ == "__main__":
     test_vl_manifest_data()
     test_outgen_heads()
     test_routgen_model()
+    test_thinking_effort()
     print(f"\nSMOKE TEST PASSED — {len(passed)} checks green")
