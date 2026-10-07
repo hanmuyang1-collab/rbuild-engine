@@ -50,7 +50,7 @@ from .outgen import OutGen, RendererMoE, ImageOutHead, VideoOutHead, TTSOutHead
 from .routgen import ROutGenModel, count_routgen_parameters
 from .critics import CriticExpert, CriticPanel, ACTHalting
 from .noting import NotingExperts, VerifiedNoteBuffer, SelfLearner
-from .thinking import ThinkingModes
+from .thinking import ThinkingModes, parse_effort_tag
 from .actuation import ActionCodec, ActuationHead, Action
 from .watermark import GreenListWatermark, WatermarkDetector
 from .optim import Muon, WSDScheduler, build_optimizer
@@ -60,7 +60,7 @@ from .data import (load_manifest, manifest_batches, hf_image_batches,
 from .train import Trainer
 from . import interactive
 
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 
 __all__ = [
     "RBuildConfig", "ModelConfig", "CacheLoopConfig", "ParallelConfig",
@@ -73,7 +73,7 @@ __all__ = [
     "ROutGenModel", "count_routgen_parameters",
     "CriticExpert", "CriticPanel", "ACTHalting",
     "NotingExperts", "VerifiedNoteBuffer", "SelfLearner",
-    "ThinkingModes", "ActionCodec", "ActuationHead", "Action",
+    "ThinkingModes", "parse_effort_tag", "ActionCodec", "ActuationHead", "Action",
     "GreenListWatermark", "WatermarkDetector",
     "Muon", "WSDScheduler", "build_optimizer", "Trainer", "interactive",
     "load_manifest", "manifest_batches", "hf_image_batches",
