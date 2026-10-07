@@ -91,7 +91,8 @@ class InteractivePanel:
                     "precision": ["fp32", "bf16", "fp8"],
                     "optimizer": ["muon", "adamw"],
                     "mode": ["vit", "encoderless"],
-                    "default_mode": ["fast", "balanced", "deep", "careful", "research"],
+                    "default_mode": ["instant", "fast", "balanced", "deep",
+                                     "careful", "research"],
                 }.get(f.name)
                 if choices:
                     widget = w.Dropdown(options=choices, value=val, description=label,
@@ -240,9 +241,14 @@ def chat(model, encode, decode, max_new_tokens: int = 64) -> None:
     Commands (type at the prompt):
       /temp <f>      temperature            /topp <f>    nucleus sampling
       /topk <i>      top-k (0 = off)        /maxn <i>    max new tokens
-      /mode <name>   thinking mode (fast/balanced/deep/careful/research,
-                     or anything you minted with thinking_mode.create)
-      /modes         list thinking modes
+      /mode <name>   thinking mode (instant/fast/balanced/deep/careful/
+                     research, or anything you minted with
+                     thinking_mode.create; "instant" = reasoning off)
+      /modes         list thinking modes (with built-in effort + reasoning)
+      /effort <tag>  selectable effort (low/medium/high by default) —
+                     multiplies the mode's built-in reasoning effort;
+                     more effort = deeper extraction, stricter critics
+      /efforts       list the selectable-effort ladder
       /remember ...  write text into fast-weight memory (no training)
       /forget        reset the fast-weight memory
       /selfstats     critic-verified self-learning stats
@@ -253,7 +259,9 @@ def chat(model, encode, decode, max_new_tokens: int = 64) -> None:
       /config        show the live config report
       /quit          exit
     Anything else is encoded, run through the extraction loop and
-    generative stages, and decoded back.
+    generative stages, and decoded back. A selectable-effort tag inside
+    the text — e.g. "explain this {effort:'high'}" — applies that effort
+    to the message.
     """
     temp, topp, topk, maxn = 1.0, 0.9, 0, max_new_tokens
     print("R-Build v3 interactive session — /help-style commands listed in docstring.")
@@ -283,6 +291,18 @@ def chat(model, encode, decode, max_new_tokens: int = 64) -> None:
             elif cmd == "/modes":
                 for name, knobs in model.thinking_mode.list().items():
                     print(f"  {name}: {knobs}")
+            elif cmd == "/effort":
+                try:
+                    model.thinking_mode.set_effort(arg)
+                    eff = model.thinking_mode.effective_effort()
+                    print(f"  [effort] selectable effort -> {arg}"
+                          + (f" (effective {eff:g})" if eff is not None else ""))
+                except KeyError as e:
+                    print(f"  [effort] {e}")
+            elif cmd == "/efforts":
+                for tag, mult in model.thinking_mode.selectable_efforts.items():
+                    cur = "  <-- active" if tag == model.thinking_mode.current_effort() else ""
+                    print(f"  {tag}: x{mult}{cur}")
             elif cmd == "/remember":
                 model.remember(encode(arg))
                 print("  [cache] fact written (gradient-free)")
@@ -306,6 +326,19 @@ def chat(model, encode, decode, max_new_tokens: int = 64) -> None:
                 print(model.cfg.report())
             else:
                 print(f"  unknown command {cmd}")
+            continue
+        # v3.2: a selectable-effort tag in the text — {effort:'high'} —
+        # applies that effort to this message (multiplies the mode's
+        # built-in reasoning effort)
+        from .thinking import parse_effort_tag
+        user, tag = parse_effort_tag(user)
+        if tag is not None:
+            try:
+                model.thinking_mode.set_effort(tag)
+                print(f"  [effort] selectable effort -> {tag}")
+            except KeyError as e:
+                print(f"  [effort] {e}")
+        if not user:
             continue
         ids = encode(user)
         if ids.ndim == 1:
