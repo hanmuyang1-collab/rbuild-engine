@@ -191,9 +191,23 @@ class ThinkingConfig:
         model.thinking_mode.create("exam", max_loops=10, y_critics=3)
         model.thinking_mode.exam()
 
+    v3.2 — effort & reasoning. Every mode also carries `effort` (float —
+    the mode's built-in reasoning effort, invisible to end users) and
+    `reasoning` (bool — False = instant, no thinking). The *selectable*
+    effort is a separate built-in ladder of named multipliers
+    (`selectable_efforts`, default low=0.5 / medium=1.0 / high=2.0) that
+    the caller picks by tag — {effort:'high'} in the prompt, /effort in
+    chat, or generate(effort="high"). Effective effort = the mode's
+    built-in effort x the selectable multiplier, and the multiplier
+    genuinely scales extraction depth, critic strictness and sampling
+    sharpness: more effort = deeper, higher-quality thinking.
+
     `custom_modes` persists user-created modes into checkpoints.
     """
     default_mode: str = "balanced"
+    default_effort: str = "medium"        # selectable-effort tag when none is given
+    selectable_efforts: Dict[str, float] = field(
+        default_factory=lambda: {"low": 0.5, "medium": 1.0, "high": 2.0})
     save_modes: bool = True
     custom_modes: Dict[str, Any] = field(default_factory=dict)
 
@@ -453,6 +467,15 @@ class RBuildConfig:
         # v3: actuation
         if a.enabled:
             assert a.screen_grid >= 4 and a.scroll_steps >= 1
+        # v3.2: thinking effort ladder (selectable effort x built-in effort)
+        t = self.thinking
+        assert t.selectable_efforts, "thinking.selectable_efforts must not be empty"
+        assert all(isinstance(v, (int, float)) and v > 0
+                   for v in t.selectable_efforts.values()), \
+            "selectable effort multipliers must be positive numbers"
+        assert t.default_effort in t.selectable_efforts, \
+            f"thinking.default_effort {t.default_effort!r} must be one of " \
+            f"{sorted(t.selectable_efforts)}"
         # v3: watermark
         w = self.watermark
         if w.enabled:
@@ -739,6 +762,7 @@ class RBuildConfig:
             f" {self.parallel.n_shared_experts} shared",
             f"  noting experts    : {noting_line}",
             f"  thinking mode     : {self.thinking.default_mode}"
+            f" (effort '{self.thinking.default_effort}')"
             + (f" (+{len(self.thinking.custom_modes)} custom)" if self.thinking.custom_modes else ""),
             f"  native actuation  : {act_line}",
             f"  gen watermark     : {'off' if not self.watermark.enabled else f'on (delta={self.watermark.delta}, gamma={self.watermark.gamma})'}",
