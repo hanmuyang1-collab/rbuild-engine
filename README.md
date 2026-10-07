@@ -48,8 +48,13 @@ tokens ─► embed ─► EXTRACTION LOOP ─► PARALLEL STAGE 1 ─► ... �
    per thinking mode (`self_observe`).
 4. **Thinking-mode creator.** `model.thinking_mode.<mode>(<value>)` retunes
    loops, Y-critics, thresholds and sampling live — built-ins
-   `fast/balanced/deep/careful/research`, and mint your own with
+   `instant/fast/balanced/deep/careful/research`, and mint your own with
    `model.thinking_mode.create("exam", max_loops=10, y_critics=3)`.
+   Every mode defines its built-in reasoning `effort` (float, invisible)
+   and a `reasoning` switch (`False` = instant, no thinking); the
+   caller-facing **selectable effort** (`{effort:'low|medium|high'}` tags)
+   multiplies it and genuinely scales extraction depth, critic strictness
+   and sampling sharpness.
 5. **VL & VaWU without a vision encoder.** `vision.mode="encoderless"`:
    patches are normalized and projected straight into `d_model` — the LLM
    itself is the vision encoder. `vision.vawu=True` adds
@@ -105,11 +110,38 @@ assert sum(p.numel() for p in model.parameters()) == cfg.count_parameters()["tot
 ```python
 model.thinking_mode.deep()                    # built-in: longer extraction, stricter critics
 model.thinking_mode.deep(12)                  # positional value = max_loops override
+model.thinking_mode.instant()                 # reasoning=False — instant, no thinking
 model.thinking_mode.create("exam", max_loops=10, y_critics=3,
-                           halt_threshold=0.9, temperature=0.2)
+                           halt_threshold=0.9, temperature=0.2,
+                           effort=1.5, reasoning=True)
 model.thinking_mode.exam()                    # your mode is now native
-model.thinking_mode.list()                    # all modes + knobs
+model.thinking_mode.list()                    # all modes + knobs (effort & reasoning included)
 ```
+
+Every mode carries two extra definitions: **`effort`** (a float — the
+mode's built-in reasoning effort, invisible to end users) and
+**`reasoning`** (a bool — `False` = instant, no thinking: the extraction
+loop runs its minimum and answers immediately). On top of that sits the
+**selectable effort**: a built-in ladder of named multipliers — `low`
+(×0.5), `medium` (×1.0), `high` (×2.0) — that callers pick *by tag*,
+unlike the invisible built-in effort:
+
+```python
+"explain this paper {effort:'high'}"          # tag inside the prompt (chat)
+model.generate(ids, effort="high")            # per call
+model.generate_image(ids, effort="low")       # media generation too
+model.thinking_mode.set_effort("high")        # or persistently
+
+# effective effort = mode's built-in effort x the selectable multiplier
+model.thinking_mode.effective_effort()        # deep (2.0) x high (2.0) = 4.0
+```
+
+And it is real, not cosmetic: raising the selectable effort deepens the
+extraction loop, requires more critics to agree, tightens the halt
+threshold, and sharpens sampling — more effort = measurably deeper,
+higher-quality thinking; `low` answers faster and shallower. `medium`
+(×1.0) is the default and reproduces each mode's declared behavior
+exactly. Add your own rungs via `cfg.thinking.selectable_efforts`.
 
 ### Self-training while running (NSCT)
 
@@ -290,8 +322,10 @@ ui = interactive.launch()           # widgets for every value, v3 sections inclu
 model = ui.model
 interactive.chat(model, encode, decode)
 # /mode deep      switch thinking mode live      /modes     list modes
+# /mode instant   reasoning off (no thinking)    /effort high   selectable effort
 # /selfstats      self-learning counters         /remember  gradient-free fact write
 # /nsct on        non-separate continuous training (default off)
+# or tag the prompt itself:  "explain this {effort:'high'}"
 ```
 
 ## Stage ladder presets (continued-training path)
