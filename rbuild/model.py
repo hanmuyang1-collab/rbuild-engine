@@ -61,6 +61,7 @@ from .critics import CriticPanel, ACTHalting
 from .noting import NotingExperts, SelfLearner
 from .thinking import ThinkingModes
 from .actuation import ActionCodec, ActuationHead
+from .v4 import DiscreteDiffusionDraft, DraftVerifyDecoder, v4_release_gate
 
 
 # --------------------------------------------------------------------------- #
@@ -146,22 +147,37 @@ class CacheLoopLine(nn.Module):
         retrieved = memory.read(keys)                    # (B, T, vd==d_model)
         return x + torch.tanh(self.read_gate) * retrieved
 
-    def _run_blocks(self, x: torch.Tensor, loop: int) -> torch.Tensor:
+    def _run_blocks(self, x: torch.Tensor, loop: int,
+                    stable_inference: bool = False) -> torch.Tensor:
         blocks = self.line if self.line is not None else self.loop_line[loop]
         for blk in blocks:
-            if self.mod is not None:
+            if self.mod is not None and not stable_inference:
                 x = self.mod(x, _TokenSubsetBlock(blk))
             else:
+                # Sequence-global MoD top-k is not prefix-invariant. The
+                # generation quality floor therefore uses the dense causal path.
                 x, _ = blk(x)
         return x
 
     def forward(self, x: torch.Tensor, memory: Optional[FastWeightMemory],
                 max_loops: Optional[int] = None,
-                y_critics: Optional[int] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+                y_critics: Optional[int] = None,
+                stable_inference: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Returns (hidden, ponder_cost_or_None). With critics enabled the loop
         is adaptive; without them it runs exactly n_loops iterations (v2).
         """
+        if stable_inference:
+            # Fixed depth + dense causal blocks make h[:t] independent of
+            # tokens after t. Both AR and draft verification use this path.
+            n = max_loops or self.n_loops
+            for loop in range(n):
+                x = self._run_blocks(x, loop % self.n_loops, stable_inference=True)
+                if memory is not None and (loop + 1) % self.read_every == 0:
+                    x = self._pull_cache(self.read_norm(x), memory)
+            self.last_halting = None
+            return x, None
+
         if self.critics is None:
             n = self.n_loops
             for loop in range(n):
@@ -227,10 +243,10 @@ class ParallelBundleStage(nn.Module):
             return self.proj(torch.cat(outs, dim=-1))
         return torch.stack(outs, 0).mean(0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, stable_inference: bool = False) -> torch.Tensor:
         outs = []
         for branch in self.branches:
-            if self.mod is not None:
+            if self.mod is not None and not stable_inference:
                 outs.append(self.mod(x, _TokenSubsetBlock(branch)))
             else:
                 outs.append(branch(x)[0])
@@ -297,6 +313,12 @@ class RBuildModel(nn.Module):
         # each decoded by a routed mixture of renderer experts (opt-in)
         self.outgen = OutGen(cfg, m.d_model) if cfg.outgen.enabled else None
 
+        # v4: shared-embedding discrete-diffusion drafter + exact AR verifier.
+        self.draft = DiscreteDiffusionDraft(cfg, m.d_model) \
+            if cfg.draft_verify.enabled else None
+        self.v4_decoder = DraftVerifyDecoder(self) if self.draft is not None else None
+        self.last_v4_stats: Dict[str, object] = {}
+
         # v3: runtime knobs driven by thinking modes
         self._runtime_max_loops: Optional[int] = None
         self._runtime_y_critics: Optional[int] = None
@@ -322,6 +344,9 @@ class RBuildModel(nn.Module):
             self._runtime_self_observe = False
 
         self.apply(self._init)
+        if self.draft is not None and cfg.draft_verify.frozen:
+            for p in self.draft.parameters():
+                p.requires_grad_(False)
 
     @staticmethod
     def _init(module):
@@ -387,18 +412,20 @@ class RBuildModel(nn.Module):
 
     # ------------------------------------------------------------------ #
     def _encode(self, input_ids: torch.Tensor,
-                images: Optional[torch.Tensor] = None):
+                images: Optional[torch.Tensor] = None,
+                stable_inference: bool = False):
         """The shared encoder path: embed -> extraction loop -> stages -> norm."""
         x, image_mask = self._splice_vision(input_ids, images)
         x = self.drop(x)
         x, ponder = self.cache_loop(x, self.memory,
                                     max_loops=self._runtime_max_loops,
-                                    y_critics=self._runtime_y_critics)
+                                    y_critics=self._runtime_y_critics,
+                                    stable_inference=stable_inference)
         for stage in self.stages:
             if self.training and self.cfg.train.grad_checkpoint and torch.is_grad_enabled():
                 x = torch.utils.checkpoint.checkpoint(stage, x, use_reentrant=False)
             else:
-                x = stage(x)
+                x = stage(x, stable_inference=stable_inference)
         return self.final_norm(x), image_mask, ponder
 
     def hidden_states(self, input_ids: torch.Tensor,
@@ -406,6 +433,14 @@ class RBuildModel(nn.Module):
         """Public access to the final hidden states (outgen heads read these)."""
         x, _, _ = self._encode(input_ids, images)
         return x
+
+    # ------------------------------------------------------------------ #
+    def _logits_from_hidden(self, x: torch.Tensor) -> torch.Tensor:
+        logits = self.lm_head(x)
+        if self.action_head is not None:
+            n_text = self.cfg.model.vocab_size
+            logits = torch.cat([logits[..., :n_text], self.action_head(x)], dim=-1)
+        return logits
 
     # ------------------------------------------------------------------ #
     def forward(self, input_ids: torch.Tensor,
@@ -420,11 +455,7 @@ class RBuildModel(nn.Module):
                 and (not self.training or self.cfg.noting.observe_in_training)):
             self._self_observe(x)
 
-        logits = self.lm_head(x)
-        # v3: action columns come from the dedicated actuation head
-        if self.action_head is not None:
-            n_text = self.cfg.model.vocab_size
-            logits = torch.cat([logits[..., :n_text], self.action_head(x)], dim=-1)
+        logits = self._logits_from_hidden(x)
 
         loss = None
         if targets is not None:
@@ -440,6 +471,12 @@ class RBuildModel(nn.Module):
             if self.outgen is not None and out_targets:           # v3.1: output heads
                 out_loss, out_bal = self.outgen.training_loss(input_ids, x, out_targets)
                 loss = loss + out_loss + out_bal
+            if (self.draft is not None and self.cfg.draft_verify.cotrain
+                    and not self.cfg.draft_verify.frozen):
+                draft_ce, draft_kl = self.draft.training_loss(
+                    input_ids, targets, logits, self.embed, self.lm_head.weight)
+                loss = (loss + self.cfg.draft_verify.draft_loss_weight * draft_ce
+                        + self.cfg.draft_verify.kl_weight * draft_kl)
         return logits, loss
 
     # ------------------------------------------------------------------ #
@@ -590,44 +627,109 @@ class RBuildModel(nn.Module):
                                    self.cfg.outgen.audio_tokens)
         return self.outgen.decode_audio(h)
 
+    # ------------------------------------------------------------------ #
+    # v4 sampling. Per-position RNG streams make AR and verified decoding
+    # byte-comparable even though they consume different numbers of proposals.
+    @staticmethod
+    def _token_rng(device, base_seed: int, token_index: int) -> torch.Generator:
+        generator = torch.Generator(device=device)
+        seed = (base_seed + 0x9E3779B9 * (token_index + 1)) % (2**63 - 1)
+        generator.manual_seed(seed)
+        return generator
+
+    def _prepare_target_logits(self, logits: torch.Tensor,
+                               previous: torch.Tensor, sampling: dict,
+                               watermark: bool) -> torch.Tensor:
+        out = logits.float() / max(1e-6, float(sampling["temperature"]))
+        if watermark:
+            # Only authoritative/committed positions receive the watermark;
+            # rejected draft proposals are never biased or emitted.
+            out = self._watermarker().bias_logits(out, previous)
+        top_k = int(sampling.get("top_k", 0))
+        top_p = float(sampling.get("top_p", 1.0))
+        if top_k > 0:
+            v, _ = torch.topk(out, min(top_k, out.shape[-1]))
+            out[out < v[:, [-1]]] = -float("inf")
+        if 0 < top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(out, descending=True)
+            cum = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            remove = cum > top_p
+            remove[..., 1:] = remove[..., :-1].clone()
+            remove[..., 0] = False
+            out.scatter_(1, sorted_idx,
+                         sorted_logits.masked_fill(remove, -float("inf")))
+        return out
+
+    def _sample_logits(self, logits: torch.Tensor,
+                       generator: Optional[torch.Generator] = None) -> torch.Tensor:
+        # Draft proposals call this with unwatermarked logits; target sampling
+        # calls _prepare_target_logits first.
+        scaled = logits.float()
+        probs = F.softmax(scaled, dim=-1)
+        return torch.multinomial(probs, 1, generator=generator)
+
+    @torch.no_grad()
+    def _ar_one(self, out: torch.Tensor, sampling: dict, watermark: bool,
+                images: Optional[torch.Tensor], base_seed: int,
+                token_index: int) -> torch.Tensor:
+        window = out[:, -self.cfg.model.max_seq_len:]
+        hidden, _, _ = self._encode(window, images=images, stable_inference=True)
+        logits = self._logits_from_hidden(hidden)[:, -1, :]
+        prepared = self._prepare_target_logits(logits, out[:, -1], sampling, watermark)
+        generator = self._token_rng(out.device, base_seed, token_index)
+        nxt = self._sample_logits(prepared, generator=generator)
+        return torch.cat([out, nxt], dim=1)
+
+    @torch.no_grad()
+    def _generate_ar(self, input_ids: torch.Tensor, max_new_tokens: int,
+                     sampling: dict, watermark: bool, eos_id: Optional[int],
+                     images: Optional[torch.Tensor], base_seed: int) -> torch.Tensor:
+        out = input_ids
+        for index in range(max_new_tokens):
+            out = self._ar_one(out, sampling, watermark, images, base_seed, index)
+            if eos_id is not None and (out[:, -1] == eos_id).all():
+                break
+        return out
+
+    def freeze_v4(self, validation: Dict[str, object]) -> Dict[str, object]:
+        """Freeze the drafter only after all three release gates pass."""
+        if not validation.get("passed", False):
+            raise ValueError(f"v4 release gates have not passed: {validation}")
+        self.cfg.draft_verify.frozen = True
+        for p in self.draft.parameters():
+            p.requires_grad_(False)
+        return dict(validation)
+
     @torch.no_grad()
     def generate(self, input_ids: torch.Tensor, max_new_tokens: int = 64,
                  temperature: Optional[float] = None, top_p: Optional[float] = None,
                  top_k: int = 0, eos_id: Optional[int] = None,
                  images: Optional[torch.Tensor] = None,
                  watermark: Optional[bool] = None,
-                 effort: Optional[str] = None) -> torch.Tensor:
+                 effort: Optional[str] = None,
+                 use_v4: Optional[bool] = None) -> torch.Tensor:
         # thinking modes set the sampling defaults; effort= picks a
         # selectable-effort tag ("low"/"medium"/"high"/...) for this call
         with self._temporary_effort(effort):
             rt = self._runtime_sampling or {}
-            temperature = temperature if temperature is not None else rt.get("temperature", 1.0)
-            top_p = top_p if top_p is not None else rt.get("top_p", 0.9)
+            sampling = {
+                "temperature": temperature if temperature is not None else rt.get("temperature", 1.0),
+                "top_p": top_p if top_p is not None else rt.get("top_p", 0.9),
+                "top_k": top_k,
+            }
             wm = self.cfg.watermark.enabled if watermark is None else watermark
+            accelerate = self.draft is not None if use_v4 is None else use_v4
+            if accelerate and self.draft is None:
+                raise ValueError("use_v4=True requires draft_verify.enabled=True")
             self.eval()
-            out = input_ids
-            for _ in range(max_new_tokens):
-                window = out[:, -self.cfg.model.max_seq_len:]
-                logits, _ = self(window, images=images)
-                nxt_logits = logits[:, -1, :].float() / max(1e-6, temperature)
-                if wm:                                            # v3: watermark bias
-                    nxt_logits = self._watermarker().bias_logits(nxt_logits, out[:, -1])
-                if top_k > 0:
-                    v, _ = torch.topk(nxt_logits, min(top_k, nxt_logits.shape[-1]))
-                    nxt_logits[nxt_logits < v[:, [-1]]] = -float("inf")
-                if 0 < top_p < 1.0:
-                    sorted_logits, sorted_idx = torch.sort(nxt_logits, descending=True)
-                    cum = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                    remove = cum > top_p
-                    remove[..., 1:] = remove[..., :-1].clone()
-                    remove[..., 0] = False
-                    nxt_logits.scatter_(1, sorted_idx, sorted_logits.masked_fill(remove, -float("inf")))
-                probs = F.softmax(nxt_logits, dim=-1)
-                nxt = torch.multinomial(probs, 1)
-                out = torch.cat([out, nxt], dim=1)
-                if eos_id is not None and (nxt == eos_id).all():
-                    break
-        return out
+            # One seed per call; each authoritative token has an independent,
+            # reproducible stream shared by AR and draft-verify paths.
+            base_seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
+            if accelerate:
+                return self.v4_decoder.generate(
+                    input_ids, max_new_tokens, sampling, wm, eos_id, images, base_seed)
+            return self._generate_ar(input_ids, max_new_tokens, sampling,
+                                     wm, eos_id, images, base_seed)
 
     # ------------------------------------------------------------------ #
     def num_params(self) -> dict:
