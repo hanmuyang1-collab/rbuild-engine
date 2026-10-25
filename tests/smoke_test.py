@@ -406,8 +406,9 @@ def test_routgen_model():
           "same CacheLoopLine + ParallelBundleStage + critic panels, no lm_head")
     check("routgen drops only text-output params",
           n == sum(p.numel() for p in text_model.parameters())
-               - sum(p.numel() for p in text_model.noting_experts.parameters()),
-          "trunk + memory + outgen identical to the text model (tied lm_head = 0)")
+               - sum(p.numel() for p in text_model.noting_experts.parameters())
+               - sum(p.numel() for p in text_model.draft.parameters()),
+          "trunk + memory + outgen identical; text noting + v4 draft removed")
     del text_model
 
     hist = Trainer(model, cfg, device="cpu", log_fn=None).fit(
