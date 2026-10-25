@@ -248,6 +248,40 @@ class WatermarkConfig:
 
 
 @dataclass
+class DraftVerifyConfig:
+    """
+    v4 — discrete-diffusion drafting with critic-gated longest-prefix verify.
+
+    The draft head is deliberately small (three layers by default), reuses the
+    main token embedding for input and output, and is distilled toward the
+    main model. Decoding proposes `draft_len` tokens in `denoise_steps`
+    absorbing-mask steps. The main model then scores the whole proposal once;
+    a draft token is committed early only when it equals the main model's own
+    AR sample AND enough token-level critics approve. Any mismatch commits the
+    main model's token instead, preserving the AR quality floor byte-for-byte.
+
+    `min_acceptance` is a release gate, not a claim about an untrained head.
+    `frozen` prevents draft updates after the acceptance, canary-quality and
+    AR byte-comparison gates have passed.
+    """
+    enabled: bool = True
+    n_layers: int = 3
+    draft_len: int = 8                 # L
+    denoise_steps: int = 3             # K
+    max_rounds: int = 2                # R_max, then one AR fallback token
+    param_fraction: float = 0.03       # approximate size vs the v3 working stack
+    d_model: Optional[int] = None      # None -> solve from param_fraction
+    ffn_dim: Optional[int] = None      # None -> 4 * draft d_model
+    n_heads: int = 4
+    cotrain: bool = True
+    draft_loss_weight: float = 1.0
+    kl_weight: float = 0.05            # distillation KL at every ladder stage
+    verify_y_critics: Optional[int] = None  # None -> critic.y_critics (Y)
+    min_acceptance: float = 0.60       # alpha release gate
+    frozen: bool = False
+
+
+@dataclass
 class MemoryConfig:
     """
     Fast-weight memory: a delta-rule key->value matrix written *without
@@ -385,6 +419,7 @@ class RBuildConfig:
     thinking: ThinkingConfig = field(default_factory=ThinkingConfig)
     actuation: ActuationConfig = field(default_factory=ActuationConfig)
     watermark: WatermarkConfig = field(default_factory=WatermarkConfig)
+    draft_verify: DraftVerifyConfig = field(default_factory=DraftVerifyConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     vision: VisionConfig = field(default_factory=VisionConfig)
     outgen: OutGenConfig = field(default_factory=OutGenConfig)
@@ -404,6 +439,22 @@ class RBuildConfig:
 
     def resolved_note_hidden(self) -> int:
         return self.noting.note_hidden or self.model.d_model
+
+    def resolved_draft_dim(self) -> int:
+        """Solve an approximately 3%-of-working-stack draft width."""
+        d = self.draft_verify
+        if d.d_model is not None:
+            return d.d_model
+        target = self.count_parameters(include_draft=False)["total_params"] * d.param_fraction
+        # Standard 4x MLP: ~= n_layers * 12*width² + input/output projections.
+        a = 12 * d.n_layers + 1
+        b = 2 * self.model.d_model
+        width = (-b + math.sqrt(b * b + 4 * a * target)) / (2 * a)
+        multiple = d.n_heads
+        return max(multiple, max(multiple, round(width / multiple)) * multiple)
+
+    def resolved_draft_ffn_dim(self) -> int:
+        return self.draft_verify.ffn_dim or 4 * self.resolved_draft_dim()
 
     def n_action_tokens(self) -> int:
         if not self.actuation.enabled:
@@ -480,6 +531,16 @@ class RBuildConfig:
         w = self.watermark
         if w.enabled:
             assert w.delta > 0 and 0.0 < w.gamma < 1.0 and w.z_threshold > 0
+        # v4: diffusion drafting + exact-AR verification
+        dv = self.draft_verify
+        if dv.enabled:
+            assert dv.n_layers >= 1 and dv.draft_len >= 1 and dv.denoise_steps >= 1
+            assert dv.max_rounds >= 1 and dv.n_heads >= 1
+            assert 0.0 < dv.param_fraction <= 0.25
+            assert dv.draft_loss_weight >= 0.0 and dv.kl_weight >= 0.0
+            assert 0.0 <= dv.min_acceptance <= 1.0
+            if dv.verify_y_critics is not None and c.enabled:
+                assert 1 <= dv.verify_y_critics <= c.n_critics
         v = self.vision
         if v.enabled:
             assert v.image_token_id is not None, \
@@ -518,7 +579,7 @@ class RBuildConfig:
     # ------------------------------------------------------------------ #
     # parameter counter (naive vs optimized stack)
     # ------------------------------------------------------------------ #
-    def count_parameters(self) -> Dict[str, int]:
+    def count_parameters(self, include_draft: bool = True) -> Dict[str, int]:
         """
         Static count of total / active (per-token) parameters. The counting
         mirrors the module tree in rbuild.model exactly — v3 critics, noting
@@ -656,8 +717,19 @@ class RBuildConfig:
                 outgen_params += renderer_head(o.audio_chunk, o.audio_tokens)
                 outgen_active += renderer_head_active(o.audio_chunk, o.audio_tokens)
 
+        # v4 draft head. Input and LM embeddings stay shared with the main
+        # model and therefore are not counted twice.
+        draft_params = 0
+        if self.draft_verify.enabled and include_draft:
+            dd = self.resolved_draft_dim()
+            df = self.resolved_draft_ffn_dim()
+            draft_block = 4 * dd * dd + 2 * dd * df + df + 7 * dd
+            draft_params = (2 * d * dd + dd * dd + 2 * dd
+                            + self.draft_verify.n_layers * draft_block)
+
         total = (cache_line + parallel_total + embed + head + fact_proj + final_norm
-                 + vision_params + noting_params + actuation_params + outgen_params)
+                 + vision_params + noting_params + actuation_params + outgen_params
+                 + draft_params)
         active = cache_line_active * cl.mod_capacity + parallel_active * p.mod_capacity \
             + embed + head + fact_proj + final_norm + vision_params \
             + noting_params + actuation_params + outgen_active
@@ -671,6 +743,7 @@ class RBuildConfig:
             "noting_params": int(noting_params),
             "actuation_params": int(actuation_params),
             "outgen_params": int(outgen_params),
+            "draft_params": int(draft_params),
             "embed_params": int(embed + head),
             "vision_params": int(vision_params),
             "memory_matrix": int(mem.key_dim * mem.value_dim if mem.enabled else 0),
@@ -748,8 +821,15 @@ class RBuildConfig:
                            f"top-{self.outgen.top_k_renderers})")
         else:
             outgen_line = "off"
+        if self.draft_verify.enabled:
+            dv = self.draft_verify
+            draft_line = (f"{dv.n_layers}-layer diffusion, L={dv.draft_len}, K={dv.denoise_steps}, "
+                          f"R_max={dv.max_rounds} ({c['draft_params']/1e6:.2f}M, "
+                          f"KL={dv.kl_weight}, frozen={dv.frozen})")
+        else:
+            draft_line = "off"
         lines = [
-            "R-Build v3 configuration report",
+            "R-Build v4 configuration report",
             "=" * 56,
             f"  extraction loop   : {self.cache_loop.n_layers} layers"
             f"  (shared={self.cache_loop.share_loop_weights}, pull every"
@@ -766,6 +846,7 @@ class RBuildConfig:
             + (f" (+{len(self.thinking.custom_modes)} custom)" if self.thinking.custom_modes else ""),
             f"  native actuation  : {act_line}",
             f"  gen watermark     : {'off' if not self.watermark.enabled else f'on (delta={self.watermark.delta}, gamma={self.watermark.gamma})'}",
+            f"  draft + verify    : {draft_line}",
             f"  fast-weight memory: {'on' if self.memory.enabled else 'off'}"
             f" (key={self.memory.key_dim}, value={self.memory.value_dim})",
             f"  vision            : {vision_line}",
