@@ -1,11 +1,35 @@
-# R-Build v3
+# R-Build v4
 
-**A fully user-modifiable, open-source LLM architecture + training-speed engine — now self-governing, and self-serving.**
+**A fully user-modifiable, open-source LLM architecture + training-speed engine — now with exact-AR draft–verify decoding, self-governing, and self-serving.**
 Every knob is yours: programmatically, through an interactive widget panel in
 Colab/Jupyter, or a console prompt anywhere else.
 
 v3.1 merges **R-Run** into this repo — R-Build builds and trains the models,
 R-Run serves them. One repo, one engine: `rrun serve` / `rrun swap`.
+
+## What's new in v4
+
+R-Build-v4 adds a tiny absorbing-mask discrete-diffusion draft head with shared
+input/output embeddings, masked-token CE, and main-model KL distillation
+(`kl_weight=0.05`). The default decode schedule is `L=8`, `K=3`, and `R_max=2`.
+The main model scores each proposal and commits only the critic-approved
+longest matching prefix; a mismatch commits the authoritative AR token. Only
+accepted/authoritative tokens enter the output and watermark path.
+
+Use `model.generate(ids, use_v4=True)` to enable it explicitly. `use_v4=False`
+provides the reference AR path. `v4_release_gate()` requires acceptance at least
+0.60, canary quality preservation, and byte-identical AR output before
+`model.freeze_v4()` will freeze the drafter. An untrained drafter does not have
+a promised speedup: the 3–4× figure remains a target to measure on trained
+checkpoints and real hardware.
+
+Run the focused acceptance suite:
+
+```bash
+PYTHONPATH=. python3 tests/v4_test.py
+```
+
+The complete v3 architecture remains available below.
 
 ## What's new in v3
 
@@ -83,7 +107,7 @@ v2, and the parameter counter still matches the built model exactly.
 ## Install
 
 ```bash
-pip install git+https://github.com/hanmuyang1-collab/rbuild-engine@v3   # v3 branch
+pip install git+https://github.com/hanmuyang1-collab/rbuild-engine@v4   # v4 branch
 pip install .                       # or from a local clone
 pip install .[notebook]             # + ipywidgets for the interactive panel
 pip install .[train]                # + transformers/datasets for the training script
