@@ -78,9 +78,12 @@ def count_routgen_parameters(cfg: RBuildConfig) -> Dict[str, int]:
       - the untied LM head        (only exists when tie_embeddings=False;
                                    tied embeddings are the shared embed table,
                                    which R-OutGen keeps for the prompt side)
+      - the v4 draft head      (text-token proposals, absent in media-only)
     """
     c = cfg.count_parameters()
-    drop = c["noting_params"] + c["actuation_params"]
+    # R-OutGen has no text LM/draft output path. The canonical text counter
+    # includes the v4 drafter when enabled, so remove it here as well.
+    drop = c["noting_params"] + c["actuation_params"] + c["draft_params"]
     if not cfg.model.tie_embeddings:
         drop += cfg.effective_vocab_size() * cfg.model.d_model
     return {
