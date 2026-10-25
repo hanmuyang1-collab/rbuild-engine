@@ -1,8 +1,9 @@
 """
-R-Build v3 — a fully user-modifiable, open-source LLM architecture and
-training-speed engine: critic-gated adaptive extraction, critic-verified
-non-separate self-training (opt-in), thinking modes, encoderless VL/VaWU,
-native actuation, and generation watermarking.
+R-Build v4 — a fully user-modifiable, open-source LLM architecture and
+training-speed engine: shared-embedding discrete-diffusion drafting,
+token-level critic verification with exact-AR fallback, plus v3 adaptive
+extraction, opt-in NSCT, thinking modes, encoderless VL/VaWU, native
+actuation, and accepted-token generation watermarking.
 
 v3.1 merges R-Run into this repo: the `rrun` package serves any R-Build
 checkpoint with one command and hot-swaps the resident model with zero
@@ -41,7 +42,7 @@ model click natively.
 from .config import (RBuildConfig, ModelConfig, CacheLoopConfig,
                      ParallelConfig, CriticConfig, NotingConfig,
                      ThinkingConfig, ActuationConfig, WatermarkConfig,
-                     MemoryConfig, VisionConfig, OutGenConfig,
+                     DraftVerifyConfig, MemoryConfig, VisionConfig, OutGenConfig,
                      TrainConfig, preset)
 from .model import RBuildModel, CacheLoopLine, ParallelBundleStage
 from .memory import FastWeightMemory
@@ -53,6 +54,7 @@ from .noting import NotingExperts, VerifiedNoteBuffer, SelfLearner
 from .thinking import ThinkingModes, parse_effort_tag
 from .actuation import ActionCodec, ActuationHead, Action
 from .watermark import GreenListWatermark, WatermarkDetector
+from .v4 import DiscreteDiffusionDraft, DraftVerifyDecoder, v4_release_gate
 from .optim import Muon, WSDScheduler, build_optimizer
 from .data import (load_manifest, manifest_batches, hf_image_batches,
                    hf_video_batches, load_image, load_video, load_audio,
@@ -60,12 +62,12 @@ from .data import (load_manifest, manifest_batches, hf_image_batches,
 from .train import Trainer
 from . import interactive
 
-__version__ = "3.2.0"
+__version__ = "4.0.0"
 
 __all__ = [
     "RBuildConfig", "ModelConfig", "CacheLoopConfig", "ParallelConfig",
     "CriticConfig", "NotingConfig", "ThinkingConfig", "ActuationConfig",
-    "WatermarkConfig", "MemoryConfig", "VisionConfig", "OutGenConfig",
+    "WatermarkConfig", "DraftVerifyConfig", "MemoryConfig", "VisionConfig", "OutGenConfig",
     "TrainConfig", "preset",
     "RBuildModel", "CacheLoopLine", "ParallelBundleStage",
     "FastWeightMemory", "VisionTower", "VaWUPooler",
@@ -75,6 +77,7 @@ __all__ = [
     "NotingExperts", "VerifiedNoteBuffer", "SelfLearner",
     "ThinkingModes", "parse_effort_tag", "ActionCodec", "ActuationHead", "Action",
     "GreenListWatermark", "WatermarkDetector",
+    "DiscreteDiffusionDraft", "DraftVerifyDecoder", "v4_release_gate",
     "Muon", "WSDScheduler", "build_optimizer", "Trainer", "interactive",
     "load_manifest", "manifest_batches", "hf_image_batches",
     "hf_video_batches", "load_image", "load_video", "load_audio",
