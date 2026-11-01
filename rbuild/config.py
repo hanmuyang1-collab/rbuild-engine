@@ -218,13 +218,15 @@ class ActuationConfig:
     v3 — native actuation: reserved action tokens let the model click,
     scroll, type and wait *by generating a token* — no external tool loop.
 
-    The output space grows by `n_action_tokens` (1 wait + grid^2 clicks +
-    2*scroll_steps scrolls + type begin/end). A dedicated ActuationHead
-    produces the action columns of the logits, so the action space stays
-    clean even with tied embeddings. Ground the head with vision
-    (encoderless + VaWU recommended: the screen is just frames).
+    Every R-Build model always has a dedicated CUA ActuationHead and codec.
+    `enabled=True` also merges the reserved action tokens into ordinary text
+    generation logits, growing that output space by `n_action_tokens` (1 wait +
+    grid^2 clicks + 2*scroll_steps scrolls + type begin/end). With
+    `enabled=False`, text logits retain their legacy shape while `model.cua`
+    remains fully available through its separate action head. Ground the head
+    with vision (encoderless + VaWU recommended: the screen is just frames).
     """
-    enabled: bool = False
+    enabled: bool = True
     screen_grid: int = 64            # click grid resolution (g x g cells)
     scroll_steps: int = 8            # discrete scroll magnitudes (up/down)
 
@@ -457,13 +459,12 @@ class RBuildConfig:
         return self.draft_verify.ffn_dim or 4 * self.resolved_draft_dim()
 
     def n_action_tokens(self) -> int:
-        if not self.actuation.enabled:
-            return 0
         a = self.actuation
         return 1 + a.screen_grid * a.screen_grid + 2 * a.scroll_steps + 2
 
     def effective_vocab_size(self) -> int:
-        return self.model.vocab_size + self.n_action_tokens()
+        action_tokens = self.n_action_tokens() if self.actuation.enabled else 0
+        return self.model.vocab_size + action_tokens
 
     # v3.1 outgen derived sizes (shared by the counter and the builders)
     def out_image_grid(self) -> int:
@@ -515,9 +516,8 @@ class RBuildConfig:
                 assert 1 <= n.verify_y_critics <= c.n_critics
             if n.write_to_memory:
                 assert mem.enabled, "noting.write_to_memory requires memory.enabled"
-        # v3: actuation
-        if a.enabled:
-            assert a.screen_grid >= 4 and a.scroll_steps >= 1
+        # Universal CUA action space (text-logit merging is optional)
+        assert a.screen_grid >= 4 and a.scroll_steps >= 1
         # v3.2: thinking effort ladder (selectable effort x built-in effort)
         t = self.thinking
         assert t.selectable_efforts, "thinking.selectable_efforts must not be empty"
@@ -805,7 +805,7 @@ class RBuildConfig:
             act_line = (f"on (+{self.n_action_tokens()} action tokens, "
                         f"grid {self.actuation.screen_grid}^2)")
         else:
-            act_line = "off"
+            act_line = "CUA only (legacy text-logit shape)"
         if self.vision.enabled:
             vision_line = (f"{self.vision.mode} ({c['vision_params']/1e6:.2f}M, "
                            f"video={'on' if self.vision.video else 'off'}"
@@ -896,10 +896,11 @@ class RBuildConfig:
 
 def _preset(name: str) -> RBuildConfig:
     cfg = RBuildConfig()
-    # Counter-verified against the ladder:
-    #   s1 20B-A3.4B | s2 90B-A8.9B | s3 118B-A19.6B | s4 219B-A40.9B | s5 411B-A61.5B
-    # (working-expert sizes are the v2 ladder; v3 critics + noting experts add
-    #  their counter-verified parameters on top — report() shows them split out)
+    # Current CUA-inclusive counter:
+    #   s1 20.6B-A3.5B | s2 93.8B-A9.4B | s3 122.0B-A19.4B
+    #   s4 227.0B-A40.8B | s5 436.9B-A70.6B
+    # (working-expert sizes are the v2 ladder; critics, noting experts, and the
+    #  universal CUA head add counter-verified parameters — report() splits them)
     ladder = {
         "s1": dict(d_model=2048, n_heads=16, n_kv_heads=4, n_loops=6,
                    n_stages=7, n_branches=6, n_experts=128, expert_top_k=8,
