@@ -52,6 +52,7 @@ from .critics import CriticExpert, CriticPanel, ACTHalting
 from .noting import NotingExperts, VerifiedNoteBuffer, SelfLearner
 from .thinking import ThinkingModes, parse_effort_tag
 from .actuation import ActionCodec, ActuationHead, Action
+from .cua import ComputerUseAgent, CUADecision, ConfirmationRequired
 from .watermark import GreenListWatermark, WatermarkDetector
 from .v4 import DiscreteDiffusionDraft, DraftVerifyDecoder, v4_release_gate
 from .v41 import (V41Config, RBuildAdaptedModel, RBuildBaseTrainer,
@@ -78,6 +79,7 @@ __all__ = [
     "CriticExpert", "CriticPanel", "ACTHalting",
     "NotingExperts", "VerifiedNoteBuffer", "SelfLearner",
     "ThinkingModes", "parse_effort_tag", "ActionCodec", "ActuationHead", "Action",
+    "ComputerUseAgent", "CUADecision", "ConfirmationRequired",
     "GreenListWatermark", "WatermarkDetector",
     "DiscreteDiffusionDraft", "DraftVerifyDecoder", "v4_release_gate",
     "V41Config", "RBuildAdaptedModel", "RBuildBaseTrainer",
