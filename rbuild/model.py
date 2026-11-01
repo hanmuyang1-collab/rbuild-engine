@@ -29,15 +29,16 @@ v3 makes the skeleton *self-governing*:
   4. Thinking modes: `model.thinking_mode.<mode>(<value>)` retunes loops,
      Y-critics, thresholds and sampling live; users mint their own modes.
 
-  5. Native actuation (optional): reserved action tokens + a dedicated head
-     — the model clicks/scrolls/types by generating a token.
+  5. Universal CUA: every model has a dedicated action head and runtime;
+     native text generation can also emit reserved action tokens directly.
 
   6. Vision (optional): v2.1 ViT mode, or v3 encoderless mode (no vision
      encoder — patches are projected straight into d_model), with optional
      VaWU whole-video summary tokens.
 
-Everything v3 can be switched off in the config; with critic/noting/
-actuation/vision disabled the architecture is bit-identical to v2.
+Critic/noting/vision features remain configurable. CUA is universal: its
+separate action head always exists, while `actuation.enabled` controls only
+whether action tokens are merged into the ordinary text-generation logits.
 """
 
 from __future__ import annotations
@@ -61,6 +62,7 @@ from .critics import CriticPanel, ACTHalting
 from .noting import NotingExperts, SelfLearner
 from .thinking import ThinkingModes
 from .actuation import ActionCodec, ActuationHead
+from .cua import ComputerUseAgent
 from .v4 import DiscreteDiffusionDraft, DraftVerifyDecoder, v4_release_gate
 
 
@@ -292,7 +294,7 @@ class RBuildModel(nn.Module):
         if self.vision is not None and cfg.vision.freeze_vision:
             for name, p_ in self.vision.named_parameters():
                 if "projector" not in name:
-                    p_.requires_grad = False
+                    p_.requires_grad_(False)
 
         # v3: noting experts + non-separate self-learner
         self.noting_experts = NotingExperts(m.d_model, cfg.memory.key_dim,
@@ -302,12 +304,11 @@ class RBuildModel(nn.Module):
             if cfg.noting.enabled else None
         self.self_learner = SelfLearner(self) if cfg.noting.enabled else None
 
-        # v3: native actuation — action codec + dedicated action head
+        # Universal CUA: every model has the same native action codec/head.
         self.action_codec = ActionCodec(m.vocab_size, cfg.actuation.screen_grid,
-                                        cfg.actuation.scroll_steps) \
-            if cfg.actuation.enabled else None
-        self.action_head = ActuationHead(m.d_model, cfg.n_action_tokens()) \
-            if cfg.actuation.enabled else None
+                                        cfg.actuation.scroll_steps)
+        self.action_head = ActuationHead(m.d_model, cfg.n_action_tokens())
+        self.cua = ComputerUseAgent(self, self.action_codec, self.action_head)
 
         # v3.1: generative OUTPUT heads — TTS / image OUT / video OUT,
         # each decoded by a routed mixture of renderer experts (opt-in)
@@ -437,7 +438,7 @@ class RBuildModel(nn.Module):
     # ------------------------------------------------------------------ #
     def _logits_from_hidden(self, x: torch.Tensor) -> torch.Tensor:
         logits = self.lm_head(x)
-        if self.action_head is not None:
+        if self.cfg.actuation.enabled:
             n_text = self.cfg.model.vocab_size
             logits = torch.cat([logits[..., :n_text], self.action_head(x)], dim=-1)
         return logits

@@ -14,10 +14,9 @@ action — one forward step, one action, no parsing layer:
     ... + 1                       type_end
 
 Usage:
-    codec = ActionCodec(vocab_size, screen_grid=64)
-    cfg.model.vocab_size = codec.extended_vocab_size   # counter + head grow
-    cfg.actuation.enabled = True
-    model = RBuildModel(cfg)
+    cfg.actuation.enabled = True    # merge actions into text-generation logits
+    model = RBuildModel(cfg)        # model.cua exists in either mode
+    codec = model.action_codec
     ...
     out = model.generate(ids, ...)
     for action in codec.decode_actions(out[0]):
@@ -40,10 +39,12 @@ import torch.nn as nn
 @dataclass
 class Action:
     """A decoded native action."""
-    kind: str                       # "wait" | "click" | "scroll" | "type_begin" | "type_end"
+    kind: str                       # wait | click | scroll | type | type_begin | type_end
     x: Optional[float] = None       # normalized [0, 1]
     y: Optional[float] = None
     dy: Optional[int] = None        # scroll steps (signed)
+    text: Optional[str] = None      # text for an explicit type action
+    irreversible: bool = False      # CUA runtime requires confirmation before execution
 
     def execute(self, driver) -> None:
         """
@@ -55,6 +56,8 @@ class Action:
             driver.click()
         elif self.kind == "scroll":
             driver.scroll(self.dy)
+        elif self.kind == "type":
+            driver.write(self.text or "")
         elif self.kind == "wait":
             import time; time.sleep(0.1)
         # type_begin/type_end are stream markers handled by the caller
@@ -92,6 +95,7 @@ class ActionCodec:
         self.type_begin_id = self.scroll_base + self.n_scroll
         self.type_end_id = self.type_begin_id + 1
         self.extended_vocab_size = self.type_end_id + 1
+        self.n_actions = self.extended_vocab_size - vocab_size
 
     # ------------------------------------------------------------------ #
     def is_action(self, token_id: int) -> bool:
