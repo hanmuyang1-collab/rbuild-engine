@@ -21,11 +21,11 @@ uses:
 Same config object, same validation, same init scheme, same counter
 invariant. Nothing about how the transformer thinks changes.
 
-What changes is only what a media generator does not need — the text
-OUTPUT side: the LM head, the actuation action head and the noting
-experts are all text-vocabulary machinery, so R-OutGen does not build
-them. In their place the v3.1 outgen heads are the model's NATIVE
-output: each is a routed mixture of renderer experts (RendererMoE —
+What changes is only what a media generator does not need — the text LM head
+and noting experts are not built. The universal CUA action head remains: media
+models use the same native computer-action space as every other R-Build model.
+The v3.1 outgen heads are the model's NATIVE media output: each is a routed
+mixture of renderer experts (RendererMoE —
 MoE applied to output modalities) that decodes the hidden states at a
 head's placeholder run straight into pixels / frames / waveform:
 
@@ -54,7 +54,9 @@ import torch
 import torch.nn as nn
 import torch.utils.checkpoint
 
+from .actuation import ActionCodec, ActuationHead
 from .config import RBuildConfig
+from .cua import ComputerUseAgent, load_cua_compatible_state
 from .layers.attention import RMSNorm
 from .memory import FastWeightMemory
 from .model import CacheLoopLine, ParallelBundleStage     # the exact text trunk
@@ -74,7 +76,6 @@ def count_routgen_parameters(cfg: RBuildConfig) -> Dict[str, int]:
     by subtracting precisely the pieces R-OutGen does not build:
 
       - the noting experts        (text self-training machinery)
-      - the actuation action head (text-vocab action columns)
       - the untied LM head        (only exists when tie_embeddings=False;
                                    tied embeddings are the shared embed table,
                                    which R-OutGen keeps for the prompt side)
@@ -83,7 +84,7 @@ def count_routgen_parameters(cfg: RBuildConfig) -> Dict[str, int]:
     c = cfg.count_parameters()
     # R-OutGen has no text LM/draft output path. The canonical text counter
     # includes the v4 drafter when enabled, so remove it here as well.
-    drop = c["noting_params"] + c["actuation_params"] + c["draft_params"]
+    drop = c["noting_params"] + c["draft_params"]
     if not cfg.model.tie_embeddings:
         drop += cfg.effective_vocab_size() * cfg.model.d_model
     return {
@@ -141,6 +142,12 @@ class ROutGenModel(nn.Module):
 
         # ---- the NATIVE output: routed renderer-MoE heads (no lm_head) ----
         self.outgen = OutGen(cfg, m.d_model)
+
+        # Universal CUA: media generation and computer use share the R-Build trunk.
+        self.action_codec = ActionCodec(m.vocab_size, cfg.actuation.screen_grid,
+                                        cfg.actuation.scroll_steps)
+        self.action_head = ActuationHead(m.d_model, cfg.n_action_tokens())
+        self.cua = ComputerUseAgent(self, self.action_codec, self.action_head)
 
         # v3 runtime knobs driven by thinking modes (same as the text model)
         self._runtime_max_loops: Optional[int] = None
@@ -355,5 +362,5 @@ class ROutGenModel(nn.Module):
         model = cls(cfg)
         state = torch.load(os.path.join(path, "model.pt"),
                            map_location=device or "cpu", weights_only=False)
-        model.load_state_dict(state)
+        load_cua_compatible_state(model, state)
         return model

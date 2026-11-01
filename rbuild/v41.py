@@ -6,8 +6,8 @@ byte-for-byte authoritative; R-Build critics and fast-weight memory are additive
 capabilities. Continued pretraining and supervised fine-tuning reuse Muon, WSD,
 gradient accumulation, mixed precision, and checkpoint persistence.
 
-No base checkpoint is hardcoded here. Qwen3-235B-A22B is only the default in the
-Rhododendron example, and can be replaced like any other base model.
+No base checkpoint is hardcoded. Every adapted model also exposes the universal
+R-Build CUA action codec, action head, training loss, and guarded runtime.
 """
 
 from __future__ import annotations
@@ -22,8 +22,10 @@ from typing import Iterable, Mapping, Optional
 import torch
 import torch.nn as nn
 
+from .actuation import ActionCodec, ActuationHead
 from .config import TrainConfig
 from .critics import CriticPanel
+from .cua import ComputerUseAgent
 from .memory import FastWeightMemory
 from .optim import WSDScheduler, build_optimizer
 from .train import _autocast_ctx, _unwrap
@@ -44,6 +46,9 @@ class V41Config:
     memory_write_lr: float = 1.0
     memory_decay: float = 0.999
     memory_max_facts: int = 65536
+    cua_vocab_size: Optional[int] = None
+    cua_screen_grid: int = 64
+    cua_scroll_steps: int = 8
     train: TrainConfig = field(default_factory=TrainConfig)
 
     def validate(self) -> None:
@@ -53,6 +58,10 @@ class V41Config:
             raise ValueError("require n_critics > 0 and 0 <= y_critics <= n_critics")
         if self.critic_capacity_mult <= 0:
             raise ValueError("critic_capacity_mult must be positive")
+        if self.cua_vocab_size is not None and self.cua_vocab_size <= 0:
+            raise ValueError("cua_vocab_size must be positive")
+        if self.cua_screen_grid <= 0 or self.cua_scroll_steps <= 0:
+            raise ValueError("CUA screen_grid and scroll_steps must be positive")
         if self.train.grad_accum <= 0 or self.train.max_steps <= 0:
             raise ValueError("grad_accum and max_steps must be positive")
 
@@ -66,6 +75,28 @@ class V41Config:
                 return int(value)
         raise ValueError(
             "Cannot infer the base hidden size; set V41Config.hidden_size explicitly"
+        )
+
+    def resolved_vocab_size(self, base_model: nn.Module) -> int:
+        if self.cua_vocab_size is not None:
+            return int(self.cua_vocab_size)
+        config = getattr(base_model, "config", None)
+        value = getattr(config, "vocab_size", None)
+        if value is not None:
+            return int(value)
+        output_head = base_model.get_output_embeddings() if hasattr(
+            base_model, "get_output_embeddings"
+        ) else None
+        if output_head is not None and hasattr(output_head, "out_features"):
+            return int(output_head.out_features)
+        for name in ("head", "lm_head", "embed_tokens", "embed"):
+            module = getattr(base_model, name, None)
+            if hasattr(module, "out_features"):
+                return int(module.out_features)
+            if hasattr(module, "num_embeddings"):
+                return int(module.num_embeddings)
+        raise ValueError(
+            "Cannot infer the base vocabulary size; set V41Config.cua_vocab_size explicitly"
         )
 
     def save(self, path: str) -> None:
@@ -123,6 +154,13 @@ class RBuildAdaptedModel(nn.Module):
             if self.config.critic_enabled
             else None
         )
+        self.action_codec = ActionCodec(
+            self.config.resolved_vocab_size(base_model),
+            self.config.cua_screen_grid,
+            self.config.cua_scroll_steps,
+        )
+        self.action_head = ActuationHead(hidden, self.action_codec.n_actions)
+        self.cua = ComputerUseAgent(self, self.action_codec, self.action_head)
 
     @classmethod
     def from_pretrained(
@@ -187,6 +225,7 @@ class RBuildAdaptedModel(nn.Module):
         return {
             "memory": self.memory.state_dict() if self.memory is not None else None,
             "critics": self.critics.state_dict() if self.critics is not None else None,
+            "action_head": self.action_head.state_dict(),
         }
 
     def save_checkpoint(self, path: str) -> None:
@@ -233,6 +272,8 @@ class RBuildAdaptedModel(nn.Module):
             model.memory.load_state_dict(adapter["memory"])
         if model.critics is not None and adapter["critics"] is not None:
             model.critics.load_state_dict(adapter["critics"])
+        if adapter.get("action_head") is not None:
+            model.action_head.load_state_dict(adapter["action_head"])
         return model.to(device)
 
 

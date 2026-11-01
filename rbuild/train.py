@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 
 from .config import RBuildConfig
+from .cua import load_cua_compatible_state
 from .model import RBuildModel
 from .optim import Muon, WSDScheduler, build_optimizer
 
@@ -227,5 +228,5 @@ class Trainer:
         model = RBuildModel(cfg)
         state = torch.load(os.path.join(path, "model.pt"),
                            map_location=device or "cpu", weights_only=False)
-        model.load_state_dict(state)
+        load_cua_compatible_state(model, state)
         return model
