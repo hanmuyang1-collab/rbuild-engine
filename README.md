@@ -1,11 +1,70 @@
-# R-Build v4
+# R-Build v4.1
 
-**A fully user-modifiable, open-source LLM architecture + training-speed engine — now with exact-AR draft–verify decoding, self-governing, and self-serving.**
+**A fully user-modifiable, open-source architecture + training-speed engine — now converting any pretrained base into R-Build with continued pretraining and supervised fine-tuning, while retaining exact-AR draft–verify decoding, self-governing, and self-serving.**
 Every knob is yours: programmatically, through an interactive widget panel in
 Colab/Jupyter, or a console prompt anywhere else.
 
 v3.1 merges **R-Run** into this repo — R-Build builds and trains the models,
 R-Run serves them. One repo, one engine: `rrun serve` / `rrun swap`.
+
+## What's new in v4.1
+
+V4.1 makes pretrained continuation the default build path instead of requiring a
+from-scratch run. `RBuildAdaptedModel` wraps **any PyTorch/Hugging Face causal-LM
+architecture** without replacing its native layers: base forward and generation
+remain exact delegations, while R-Build critic panels and delta-rule fast-weight
+memory are additive. The original native R-Build architecture, MoD/MoE/shared
+experts, V4 draft–verify decoder, media heads, actuation, watermarking, and R-Run
+remain available — no feature is removed.
+
+Both training modes reuse the original Muon + WSD stack:
+
+- **Continued pretraining (CPT):** packed raw-document causal-LM batches.
+- **Supervised fine-tuning (SFT):** prompt/response batches with prompt labels
+  masked to `-100`, so loss is computed on responses rather than instructions.
+- Full-base or adapter-only training, gradient accumulation, bf16/fp8 contract,
+  periodic checkpoints, resume state, and capability-preservation release gates.
+
+The base checkpoint is always caller-modifiable. **Qwen3-235B-A22B is only the
+default starting checkpoint in `examples/train_rhododendron_v41.py`; it is not a
+global R-Build dependency or a fixed architecture.**
+
+```python
+from rbuild import RBuildAdaptedModel, RBuildBaseTrainer, V41Config
+from rbuild import continued_pretraining_batches, supervised_fine_tuning_batches
+
+cfg = V41Config()                    # memory + critics; every value modifiable
+cfg.train.max_steps = 10_000
+model = RBuildAdaptedModel.from_pretrained(
+    "your/selected-base", cfg, torch_dtype="auto", low_cpu_mem_usage=True)
+
+cpt = continued_pretraining_batches(tokenizer, documents, seq_len=4096)
+sft = supervised_fine_tuning_batches(tokenizer, prompt_response_rows, seq_len=4096)
+trainer = RBuildBaseTrainer(model, cfg)
+trainer.fit(cpt)                     # continued pretraining
+trainer.fit(sft)                     # optional supervised fine-tuning
+trainer.save_checkpoint("ckpt_v41")
+```
+
+For Rhododendron's selectable Qwen starting point:
+
+```bash
+python examples/train_rhododendron_v41.py --mode cpt \
+    --base-model Qwen/Qwen3-235B-A22B --dataset HuggingFaceFW/fineweb-edu \
+    --dataset-name sample-10BT
+python examples/train_rhododendron_v41.py --mode sft \
+    --base-model Qwen/Qwen3-235B-A22B --dataset your/rhododendron-sft
+```
+
+`v41_release_gate()` requires exact base/adapted output on the disabled path and
+non-regressing capability canaries. Run both current acceptance suites:
+
+```bash
+PYTHONPATH=. python3 tests/v4_test.py
+PYTHONPATH=. python3 tests/v41_test.py
+```
+
+See **R-Build-V4.1-DESIGN.md** for the conversion and training contract.
 
 ## What's new in v4
 
@@ -376,11 +435,14 @@ treat them as starting points and retune in the panel.
   ten numbered steps from preset to checkpoint, every input validated,
   every default recommended. Anyone can run it:
   `python examples/train_interactive.py`
+- `examples/train_rhododendron_v41.py` — V4.1 CPT/SFT from a selectable
+  pretrained base; Qwen3-235B-A22B is the Rhododendron-only default.
 - `examples/train_rhododendron_lite.py` — full training run for
   **rhododendron-lite (20B-A3.5B, blind)**: HF streaming data, Muon + WSD,
   bf16/fp8 flags, gradient checkpointing, periodic checkpoints, resume,
   FSDP/DDP via torchrun, optional push to the GeoThinkAI org.
 
-See **R-Build-V3-DESIGN.md** for the architecture blueprint.
+See **R-Build-V4.1-DESIGN.md** for conversion/training and
+**R-Build-V3-DESIGN.md** for the native architecture blueprint.
 
 Apache-2.0. Part of the GeoThinkAI R-Build project.
