@@ -25,9 +25,17 @@ Both training modes reuse the original Muon + WSD stack:
 - Full-base or adapter-only training, gradient accumulation, bf16/fp8 contract,
   periodic checkpoints, resume state, and capability-preservation release gates.
 
-The base checkpoint is always caller-modifiable. **Qwen3-235B-A22B is only the
-default starting checkpoint in `examples/train_rhododendron_v41.py`; it is not a
-global R-Build dependency or a fixed architecture.**
+The base checkpoint is always caller-selected and modifiable. No project-specific
+or global checkpoint default is hardcoded.
+
+**Every R-Build model is a CUA.** Native text models, R-OutGen media models, and
+adapted pretrained models all expose `model.cua` with the same reserved action
+codec and dedicated action head. Use `cua.observe(...)`/`cua.propose(hidden)` to
+propose click/scroll/type/wait actions, `cua.action_loss(...)` for supervised CUA
+trajectories, and `cua.execute(...)` with a real driver to perform OS operations.
+The action head requires computer-use training; constructing it does not by itself
+prove operator competence. Irreversible action batches require `confirmed=True`,
+and confirmation is checked before any side effect.
 
 ```python
 from rbuild import RBuildAdaptedModel, RBuildBaseTrainer, V41Config
@@ -46,22 +54,24 @@ trainer.fit(sft)                     # optional supervised fine-tuning
 trainer.save_checkpoint("ckpt_v41")
 ```
 
-For Rhododendron's selectable Qwen starting point:
+For a caller-selected pretrained starting point:
 
 ```bash
-python examples/train_rhododendron_v41.py --mode cpt \
-    --base-model Qwen/Qwen3-235B-A22B --dataset HuggingFaceFW/fineweb-edu \
+python examples/train_base_v41.py --mode cpt \
+    --base-model your/selected-base --dataset HuggingFaceFW/fineweb-edu \
     --dataset-name sample-10BT
-python examples/train_rhododendron_v41.py --mode sft \
-    --base-model Qwen/Qwen3-235B-A22B --dataset your/rhododendron-sft
+python examples/train_base_v41.py --mode sft \
+    --base-model your/selected-base --dataset your/sft-data
 ```
 
 `v41_release_gate()` requires exact base/adapted output on the disabled path and
-non-regressing capability canaries. Run both current acceptance suites:
+non-regressing capability canaries. Run the acceptance and smoke suites:
 
 ```bash
 PYTHONPATH=. python3 tests/v4_test.py
 PYTHONPATH=. python3 tests/v41_test.py
+PYTHONPATH=. python3 tests/cua_test.py
+PYTHONPATH=. python3 tests/smoke_test.py
 ```
 
 See **R-Build-V4.1-DESIGN.md** for the conversion and training contract.
@@ -144,10 +154,12 @@ tokens ─► embed ─► EXTRACTION LOOP ─► PARALLEL STAGE 1 ─► ... �
    Video-as-Whole-Understanding: learned-query attention pooling compresses
    all frames into whole-video summary tokens, prepended to the frame
    stream. (The v2.1 ViT tower remains as `vision.mode="vit"`.)
-6. **Native actuation.** `actuation.enabled=True` reserves action tokens in
-   the output space — click(x, y) on a screen grid, scroll, type, wait —
-   produced by a dedicated action head. Generating a token *is* the action;
-   no external tool loop.
+6. **Universal CUA / native actuation.** Every model has a dedicated CUA action
+   head and `model.cua` runtime — click(x, y) on a screen grid, scroll, type,
+   and wait. By default, reserved action tokens also extend native text-generation
+   logits. Setting `actuation.enabled=False` preserves legacy text-logit shapes
+   but does not remove the separate CUA interface. Real side effects require an
+   explicit driver, and irreversible actions require confirmation.
 7. **Generation watermarking.** `watermark.enabled=True` biases sampling with
    a secret-keyed green list, so anything your model writes is provably
    yours — `WatermarkDetector` runs a z-test with the same key. Pure
@@ -159,9 +171,9 @@ tokens ─► embed ─► EXTRACTION LOOP ─► PARALLEL STAGE 1 ─► ... �
    directly (no conversion); `vllm`, `hf` and `mock` backends cover
    everything else.
 
-Everything v3 can be switched off independently; with `critic`, `noting`,
-`actuation` and `vision` all disabled the architecture is bit-identical to
-v2, and the parameter counter still matches the built model exactly.
+Critic, noting, and vision features remain independently configurable. CUA is
+universal; `actuation.enabled` controls only text-logit extension. The parameter
+counter includes the dedicated action head and matches the built model exactly.
 
 ## Install
 
@@ -178,7 +190,7 @@ pip install .[serve]                # + fastapi/uvicorn for the rrun server
 ```python
 from rbuild import RBuildConfig, RBuildModel, Trainer, preset
 
-cfg = preset("s1")                  # counter-verified: 20.0B total / 3.5B active
+cfg = preset("s1")                  # counter-verified: 20.6B total / 3.5B active
 cfg.critic.n_critics = 8            # X critics per panel — change anything
 cfg.critic.y_critics = 4            # Y must be satisfied to halt extraction
 cfg.train.precision = "bf16"
@@ -376,8 +388,8 @@ model: the same `CacheLoopLine` extraction loop (critic-gated, ACT-halted,
 pulling the fast-weight cache), the same `ParallelBundleStage` generative
 stages (MoE branches + stage critic panels), the same `FastWeightMemory`,
 `VisionTower` and `ThinkingModes`, built from the same config. Only the
-text-*output* machinery is dropped (LM head, action head, noting
-experts); the renderer-MoE heads are the model's **native** output:
+text-*output* machinery is dropped (LM head and noting experts); the universal
+CUA head remains, and the renderer-MoE heads are the model's **native** output:
 
 ```python
 from rbuild import ROutGenModel, count_routgen_parameters, Trainer
@@ -413,16 +425,16 @@ interactive.chat(model, encode, decode)
 
 ## Stage ladder presets (continued-training path)
 
-| preset | total (v3) | active/token | v3 additions |
+| preset | total (CUA included) | active/token | v3 additions |
 |---|---|---|---|
-| s1 | 20.0B | 3.5B | +101M critics, +19M noting |
-| s2 | 90.7B | 9.0B | critics scale with stage widths |
-| s3 | 118.4B | 19.4B | wider-per-token, not deeper |
-| s4 | 219.3B | 40.9B | |
-| s5 | 415.0B | 61.9B | |
+| s1 | 20.6B | 3.5B | +101M critics, +19M noting |
+| s2 | 93.8B | 9.4B | critics scale with stage widths |
+| s3 | 122.0B | 19.4B | wider-per-token, not deeper |
+| s4 | 227.0B | 40.8B | |
+| s5 | 436.9B | 70.6B | |
 
-Working-expert sizes are the v2 ladder; v3 critics + noting experts add
-their counter-verified parameters on top (`report()` splits them out).
+Working-expert sizes are the v2 ladder; v3 critics, noting experts, and the
+universal CUA head add their counter-verified parameters on top (`report()` splits them out).
 Critics cost ~0.5% of total parameters. All presets are counter-verified;
 treat them as starting points and retune in the panel.
 
@@ -435,8 +447,8 @@ treat them as starting points and retune in the panel.
   ten numbered steps from preset to checkpoint, every input validated,
   every default recommended. Anyone can run it:
   `python examples/train_interactive.py`
-- `examples/train_rhododendron_v41.py` — V4.1 CPT/SFT from a selectable
-  pretrained base; Qwen3-235B-A22B is the Rhododendron-only default.
+- `examples/train_base_v41.py` — generic V4.1 CPT/SFT from an explicitly
+  selected pretrained base; no checkpoint default.
 - `examples/train_rhododendron_lite.py` — full training run for
   **rhododendron-lite (20B-A3.5B, blind)**: HF streaming data, Muon + WSD,
   bf16/fp8 flags, gradient checkpointing, periodic checkpoints, resume,

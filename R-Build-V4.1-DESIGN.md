@@ -19,8 +19,8 @@ uses two supported paths:
 
 | path | trunk | R-Build capabilities |
 |---|---|---|
-| **Native** | original R-Build MoD → fine-grained MoE → shared experts → critic workflow | complete V3/V4 engine |
-| **Adapted** | the selected pretrained architecture, unchanged | additive critic panel, fast-weight memory, common CPT/SFT, checkpoints, release gates |
+| **Native** | original R-Build MoD → fine-grained MoE → shared experts → critic workflow | complete V3/V4 engine and universal CUA |
+| **Adapted** | the selected pretrained architecture, unchanged | additive critic panel, fast-weight memory, universal CUA, common CPT/SFT, checkpoints, release gates |
 
 The original expert workflow is preserved in the native engine. An adapted base
 keeps its own native computation exactly; R-Build modules never silently rewrite
@@ -32,10 +32,9 @@ its logits or generation path.
 PyTorch model. `RBuildAdaptedModel.from_pretrained(base_model_id, ...)` loads a
 caller-selected Hugging Face causal LM.
 
-There is no global default checkpoint. Qwen3-235B-A22B appears only as the
-default `--base-model` in `examples/train_rhododendron_v41.py`, because that is
-Rhododendron's selected starting point. Passing another `--base-model` changes
-the base without changing R-Build.
+There is no global or project-specific default checkpoint. The generic
+`examples/train_base_v41.py` entry point requires `--base-model`; selecting a
+different checkpoint does not change R-Build.
 
 Construction must not modify base parameters. `forward()` and `generate()` are
 exact delegations to the base, so merely wrapping a model cannot degrade its
@@ -55,6 +54,30 @@ The adapter uses the original delta-rule key→value matrix. `remember_hidden()`
 detaches hidden states, optionally requires Y critic votes, and writes approved
 key/value pairs without gradients. `recall_hidden()` reads the matrix. Memory and
 critic states persist alongside the base checkpoint.
+
+### Universal CUA
+
+`RBuildModel`, `ROutGenModel`, and `RBuildAdaptedModel` always construct the same
+`ActionCodec`, dedicated `ActuationHead`, and `ComputerUseAgent` runtime as
+`model.cua`. The common contract provides:
+
+- `observe(...)` / `propose(hidden_states)` for native hidden-state action proposals;
+- `decode(token_ids)` for reserved click, scroll, type, and wait tokens;
+- `action_loss(hidden_states, action_token_ids)` for supervised CUA trajectories;
+- `execute(actions, driver)` for real caller-provided OS drivers;
+- `act(hidden_states, driver)` for a complete propose-and-execute step.
+
+Native text models merge action columns into ordinary generation logits by default.
+`actuation.enabled=False` retains legacy text-logit dimensions but leaves the
+separate CUA head/runtime intact. R-OutGen keeps its renderer outputs and CUA head.
+Adapted models keep exact base `forward()`/`generate()` delegation and persist the
+CUA head in the adapter checkpoint.
+
+An initialized action head is not evidence of computer-use competence: the model
+must be trained and evaluated on grounded CUA trajectories. Real operations occur
+only through an explicit runtime driver. If a batch is marked irreversible, or any
+action has `irreversible=True`, execution requires `confirmed=True`; the guard runs
+before the first side effect.
 
 ### Existing native capabilities
 
@@ -131,5 +154,8 @@ multilingual, tool, vision, or other base capabilities were preserved.
 - real CPT and SFT optimizer steps;
 - capability-regression gate failures.
 
-The existing V3/V4 suites remain required, proving that V4.1 did not remove or
+`tests/cua_test.py` covers all three model classes, native proposals and action
+loss, legacy text-logit compatibility, pre-universal-CUA checkpoint recovery,
+real fake-driver side effects, and pre-side-effect irreversible-action confirmation. The existing V3/V4
+and complete smoke suites remain required, proving that V4.1 did not remove or
 break the native engine.
