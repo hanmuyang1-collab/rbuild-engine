@@ -1,9 +1,8 @@
 """
-R-Build v4 — a fully user-modifiable, open-source LLM architecture and
-training-speed engine: shared-embedding discrete-diffusion drafting,
-token-level critic verification with exact-AR fallback, plus v3 adaptive
-extraction, opt-in NSCT, thinking modes, encoderless VL/VaWU, native
-actuation, and accepted-token generation watermarking.
+R-Build v4.1 — a fully user-modifiable, open-source architecture and
+training-speed engine. Non-destructive adapters convert any pretrained base
+into an R-Build system with continued pretraining and supervised fine-tuning;
+the complete v4 draft-verify and v3 expert/memory/media capabilities remain.
 
 v3.1 merges R-Run into this repo: the `rrun` package serves any R-Build
 checkpoint with one command and hot-swaps the resident model with zero
@@ -55,6 +54,9 @@ from .thinking import ThinkingModes, parse_effort_tag
 from .actuation import ActionCodec, ActuationHead, Action
 from .watermark import GreenListWatermark, WatermarkDetector
 from .v4 import DiscreteDiffusionDraft, DraftVerifyDecoder, v4_release_gate
+from .v41 import (V41Config, RBuildAdaptedModel, RBuildBaseTrainer,
+                  continued_pretraining_batches, supervised_fine_tuning_batches,
+                  v41_release_gate)
 from .optim import Muon, WSDScheduler, build_optimizer
 from .data import (load_manifest, manifest_batches, hf_image_batches,
                    hf_video_batches, load_image, load_video, load_audio,
@@ -62,7 +64,7 @@ from .data import (load_manifest, manifest_batches, hf_image_batches,
 from .train import Trainer
 from . import interactive
 
-__version__ = "4.0.0"
+__version__ = "4.1.0"
 
 __all__ = [
     "RBuildConfig", "ModelConfig", "CacheLoopConfig", "ParallelConfig",
@@ -78,6 +80,8 @@ __all__ = [
     "ThinkingModes", "parse_effort_tag", "ActionCodec", "ActuationHead", "Action",
     "GreenListWatermark", "WatermarkDetector",
     "DiscreteDiffusionDraft", "DraftVerifyDecoder", "v4_release_gate",
+    "V41Config", "RBuildAdaptedModel", "RBuildBaseTrainer",
+    "continued_pretraining_batches", "supervised_fine_tuning_batches", "v41_release_gate",
     "Muon", "WSDScheduler", "build_optimizer", "Trainer", "interactive",
     "load_manifest", "manifest_batches", "hf_image_batches",
     "hf_video_batches", "load_image", "load_video", "load_audio",

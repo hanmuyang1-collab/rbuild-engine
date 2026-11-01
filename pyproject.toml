@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rbuild-engine"
-version = "4.0.0"
-description = "R-Build v4: critic-gated adaptive LLM training with shared-embedding discrete-diffusion drafting, token-level critic verification, exact-AR fallback, accepted-token watermarking, and KL distillation — plus the complete v3 engine and R-Run serving."
+version = "4.1.0"
+description = "R-Build v4.1: non-destructive conversion of any pretrained architecture, continued pretraining and supervised fine-tuning with Muon + WSD, plus the complete V4 draft-verify, V3 expert, memory, media, actuation, and R-Run engine."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
