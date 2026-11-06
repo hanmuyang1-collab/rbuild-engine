@@ -25,10 +25,11 @@ import torch.nn as nn
 from .actuation import ActionCodec, ActuationHead
 from .config import TrainConfig
 from .critics import CriticPanel
-from .cua import ComputerUseAgent
+from .cua import CUAApplicationAdapter, ComputerUseAgent, freeze_for_cua as freeze_cua_parameters
 from .memory import FastWeightMemory
 from .optim import WSDScheduler, build_optimizer
 from .train import _autocast_ctx, _unwrap
+from .vision import EncoderlessScreenshotProjector
 
 
 @dataclass
@@ -49,6 +50,10 @@ class V41Config:
     cua_vocab_size: Optional[int] = None
     cua_screen_grid: int = 64
     cua_scroll_steps: int = 8
+    cua_screenshot_enabled: bool = False
+    cua_screenshot_size: int = 64
+    cua_screenshot_patch: int = 16
+    cua_screenshot_channels: int = 3
     train: TrainConfig = field(default_factory=TrainConfig)
 
     def validate(self) -> None:
@@ -62,6 +67,13 @@ class V41Config:
             raise ValueError("cua_vocab_size must be positive")
         if self.cua_screen_grid <= 0 or self.cua_scroll_steps <= 0:
             raise ValueError("CUA screen_grid and scroll_steps must be positive")
+        if (
+            self.cua_screenshot_size <= 0
+            or self.cua_screenshot_patch <= 0
+            or self.cua_screenshot_channels <= 0
+            or self.cua_screenshot_size % self.cua_screenshot_patch
+        ):
+            raise ValueError("CUA screenshot dimensions and patch size are invalid")
         if self.train.grad_accum <= 0 or self.train.max_steps <= 0:
             raise ValueError("grad_accum and max_steps must be positive")
 
@@ -161,6 +173,18 @@ class RBuildAdaptedModel(nn.Module):
         )
         self.action_head = ActuationHead(hidden, self.action_codec.n_actions)
         self.cua = ComputerUseAgent(self, self.action_codec, self.action_head)
+        self.screenshot_projector = (
+            EncoderlessScreenshotProjector(
+                hidden,
+                self.config.cua_screenshot_size,
+                self.config.cua_screenshot_patch,
+                self.config.cua_screenshot_channels,
+            )
+            if self.config.cua_screenshot_enabled
+            else None
+        )
+        self.cua_adapters = nn.ModuleDict()
+        self._active_cua_adapter: Optional[str] = None
 
     @classmethod
     def from_pretrained(
@@ -185,6 +209,31 @@ class RBuildAdaptedModel(nn.Module):
 
     def generate(self, *args, **kwargs):
         return self.base_model.generate(*args, **kwargs)
+
+    def freeze_for_cua(self) -> None:
+        """Train only the existing CUA head and opt-in CUA adapters/projector."""
+        freeze_cua_parameters(self)
+
+    def add_cua_adapter(self, name: str, rank: int = 8, alpha: float = 16.0) -> None:
+        """Attach a zero-initialized application adapter to the shared CUA path."""
+        if not name or name in self.cua_adapters:
+            raise ValueError("CUA adapter names must be nonempty and unique")
+        self.cua_adapters[name] = CUAApplicationAdapter(self.hidden_size, rank, alpha)
+
+    def activate_cua_adapter(self, name: Optional[str] = None) -> None:
+        if name is not None and name not in self.cua_adapters:
+            raise KeyError(f"Unknown CUA application adapter: {name}")
+        self._active_cua_adapter = name
+
+    def transform_cua_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._active_cua_adapter is None:
+            return hidden_states
+        return self.cua_adapters[self._active_cua_adapter](hidden_states)
+
+    def screenshot_hidden(self, screenshots: torch.Tensor) -> torch.Tensor:
+        if self.screenshot_projector is None:
+            raise RuntimeError("Enable V41Config.cua_screenshot_enabled for screenshot CUA")
+        return self.screenshot_projector(screenshots)
 
     def freeze_base(self, frozen: bool = True) -> None:
         """Choose full base training or adapter-only fine-tuning at runtime."""
@@ -226,6 +275,16 @@ class RBuildAdaptedModel(nn.Module):
             "memory": self.memory.state_dict() if self.memory is not None else None,
             "critics": self.critics.state_dict() if self.critics is not None else None,
             "action_head": self.action_head.state_dict(),
+            "screenshot_projector": (
+                self.screenshot_projector.state_dict()
+                if self.screenshot_projector is not None else None
+            ),
+            "cua_adapters": self.cua_adapters.state_dict(),
+            "cua_adapter_specs": {
+                name: {"rank": adapter.rank, "alpha": adapter.alpha}
+                for name, adapter in self.cua_adapters.items()
+            },
+            "active_cua_adapter": self._active_cua_adapter,
         }
 
     def save_checkpoint(self, path: str) -> None:
@@ -274,6 +333,13 @@ class RBuildAdaptedModel(nn.Module):
             model.critics.load_state_dict(adapter["critics"])
         if adapter.get("action_head") is not None:
             model.action_head.load_state_dict(adapter["action_head"])
+        if model.screenshot_projector is not None and adapter.get("screenshot_projector") is not None:
+            model.screenshot_projector.load_state_dict(adapter["screenshot_projector"])
+        for name, spec in adapter.get("cua_adapter_specs", {}).items():
+            model.add_cua_adapter(name, spec["rank"], spec["alpha"])
+        if adapter.get("cua_adapters"):
+            model.cua_adapters.load_state_dict(adapter["cua_adapters"])
+        model.activate_cua_adapter(adapter.get("active_cua_adapter"))
         return model.to(device)
 
 
@@ -374,6 +440,60 @@ class RBuildBaseTrainer:
                     self.log(
                         f"step {self.step}/{max_steps}  loss {history[-1]:.4f}  "
                         f"lr_x{lr_factor:.3f}  batch_tokens {tokens}  "
+                        f"elapsed {time.time() - started:.1f}s"
+                    )
+                if save_every > 0 and save_dir and self.step % save_every == 0:
+                    self.save_checkpoint(save_dir)
+        return {"loss": history, "steps": self.step}
+
+    def fit_cua(
+        self,
+        batches: Iterable,
+        max_steps: Optional[int] = None,
+        save_every: int = 0,
+        save_dir: Optional[str] = None,
+    ) -> dict:
+        """Train the shared action head on verified hidden/action replay batches.
+
+        Call ``RBuildAdaptedModel.freeze_for_cua()`` before constructing this
+        trainer for the low-VRAM frozen-base path.
+        """
+        raw = _unwrap(self.model)
+        if not hasattr(raw, "cua"):
+            raise ValueError("fit_cua requires a model exposing model.cua")
+        max_steps = max_steps or self.config.train.max_steps
+        self.model.train()
+        history, accumulation, started = [], 0, time.time()
+        data_iter = iter(batches)
+        while self.step < max_steps:
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(batches)
+                batch = next(data_iter)
+            inputs = dict(_move_batch(batch, self.device))
+            lr_factor = self.scheduler.set(self.step)
+            with _autocast_ctx(self.config.train.precision, self.device_type):
+                loss = raw.cua.action_loss(
+                    inputs["hidden_states"], inputs["action_token_ids"]
+                )
+                scaled_loss = loss / self.config.train.grad_accum
+            scaled_loss.backward()
+            accumulation += 1
+            if accumulation % self.config.train.grad_accum == 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.config.train.grad_clip
+                )
+                for optimizer in self.optimizers:
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                self.step += 1
+                history.append(float(loss.detach()))
+                if self.step == 1 or self.step % 10 == 0:
+                    supervised = int((inputs["action_token_ids"] != -100).sum())
+                    self.log(
+                        f"cua step {self.step}/{max_steps}  loss {history[-1]:.4f}  "
+                        f"lr_x{lr_factor:.3f}  actions {supervised}  "
                         f"elapsed {time.time() - started:.1f}s"
                     )
                 if save_every > 0 and save_dir and self.step % save_every == 0:
