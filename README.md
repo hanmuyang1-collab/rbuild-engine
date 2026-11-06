@@ -37,6 +37,44 @@ The action head requires computer-use training; constructing it does not by itse
 prove operator competence. Irreversible action batches require `confirmed=True`,
 and confirmation is checked before any side effect.
 
+The complete CUA reliability and adaptation stack is implemented on the existing
+codec, action head, critics, hidden states, and Muon/WSD trainer:
+
+1. **Uncertainty abstention:** `propose(..., max_entropy=..., min_confidence=...)`
+   emits `wait` or requires confirmation per batch row.
+2. **Critic-verified candidates:** `propose_verified()` ranks top-k actions with the
+   existing critic panel; `act_verified()` also checks an expected postcondition.
+3. **Event-driven observation:** `ScreenChangeDetector` and `observe_if_changed()`
+   skip unchanged screens while retaining bounded timed polling.
+4. **Shadow mode:** `ShadowDriver` records actions without calling a wrapped real
+   driver, so dry runs cannot produce OS side effects.
+5. **Verified trajectory replay:** `CUATrajectoryBuffer` accepts verified examples
+   only, stores hidden states as bounded CPU fp16, and pads action labels with `-100`.
+6. **Application policies:** `CUAPolicy`/`PolicyDriver` enforce action allowlists,
+   coordinate/scroll/text limits, deny rules, confirmation, and rate limits before
+   the first side effect.
+7. **Release gates:** `run_cua_contract_canaries()` and `cua_release_gate()` check
+   all three model classes and reject safety regressions.
+8. **Deterministic audit/replay:** `CUAReplayLedger` persists bounded rotating JSONL
+   records and replays the recorded actions rather than sampling new ones.
+9. **Frozen-base adaptation:** `freeze_for_cua()` plus `RBuildBaseTrainer.fit_cua()`
+   trains only CUA components through the existing optimizer and scheduler.
+10. **Encoderless screenshots:** adapted models can opt into one convolutional patch
+    projector and `observe_screenshot()` without a second vision encoder.
+11. **Application adapters:** named, zero-initialized low-rank residual adapters
+    specialize the shared CUA hidden path and round-trip through checkpoints.
+12. **Interruption/recovery curriculum:** `build_recovery_curriculum()` derives
+    verified variants for dialogs, moved scroll targets, loading, stale screens,
+    and failed clicks.
+
+Runtime verification, policies, auditing, replay, and recovery add no model
+parameters. Screenshot and application-adapter weights are adapted-model-only and
+opt-in; native/R-OutGen parameter counters and adapted base `forward()`/`generate()`
+delegation are unchanged. Postcondition failure is audited but cannot roll back
+side effects that already occurred, so destructive work still requires policy and
+confirmation controls. Contract canaries validate interfaces and safety behavior;
+grounded application canaries remain necessary before a real release.
+
 ```python
 from rbuild import RBuildAdaptedModel, RBuildBaseTrainer, V41Config
 from rbuild import continued_pretraining_batches, supervised_fine_tuning_batches
@@ -52,6 +90,34 @@ trainer = RBuildBaseTrainer(model, cfg)
 trainer.fit(cpt)                     # continued pretraining
 trainer.fit(sft)                     # optional supervised fine-tuning
 trainer.save_checkpoint("ckpt_v41")
+```
+
+Frozen-base CUA training and application specialization reuse that adapted model:
+
+```python
+from rbuild import CUATrajectory, CUATrajectoryBuffer
+
+model.add_cua_adapter("desktop", rank=8, alpha=16.0)
+model.activate_cua_adapter("desktop")
+model.freeze_for_cua()               # base, memory, and critics stay frozen
+
+replay = CUATrajectoryBuffer(max_trajectories=1024, max_bytes=2 * 1024**3)
+replay.add(CUATrajectory(hidden_states, action_token_ids, verified=True))
+cua_trainer = RBuildBaseTrainer(model, cfg)
+cua_trainer.fit_cua(replay.batches(batch_size=4), max_steps=100)
+```
+
+A verified dry run uses the existing critics and a fake driver; `real_driver` is
+never called:
+
+```python
+shadow = model.cua.shadow(real_driver)
+shadow.postconditions["target_ready"] = True
+decision = model.cua.act_verified(
+    hidden_states, shadow, candidates=4,
+    expected_postcondition="target_ready",
+)
+print(decision.verification["candidate_votes"], shadow.events)
 ```
 
 For a caller-selected pretrained starting point:
@@ -71,6 +137,7 @@ non-regressing capability canaries. Run the acceptance and smoke suites:
 PYTHONPATH=. python3 tests/v4_test.py
 PYTHONPATH=. python3 tests/v41_test.py
 PYTHONPATH=. python3 tests/cua_test.py
+PYTHONPATH=. python3 tests/cua_expansion_test.py
 PYTHONPATH=. python3 tests/smoke_test.py
 ```
 
@@ -109,9 +176,8 @@ tokens ─► embed ─► EXTRACTION LOOP ─► PARALLEL STAGE 1 ─► ... �
                     │  halted: runs      │  (more capacity than the workers —
                     │  until Y critics   │  they verify the bundle and gate
                     │  are satisfied,    │  the self-training pipeline)
-                    │  pulling the       │
-                    │  fast-weight       ▼
-                    │  cache each loop   logits (+ native action tokens)
+                    │  pulling the       ▼
+                    │  fast-weight       logits (+ native action tokens)
                     ▼
             FastWeightMemory — delta-rule key→value matrix.
             v3: critic-verified notes written by the model's own
