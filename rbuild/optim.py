@@ -90,9 +90,12 @@ def build_optimizer(model: nn.Module, cfg) -> List[torch.optim.Optimizer]:
     elif muon_params:
         opts.append(torch.optim.AdamW(muon_params, lr=cfg.train.adamw_lr,
                                       weight_decay=cfg.train.weight_decay))
-    opts.append(torch.optim.AdamW(adamw_params, lr=cfg.train.adamw_lr,
-                                  weight_decay=cfg.train.weight_decay,
-                                  betas=(0.9, 0.95)))
+    if adamw_params:
+        opts.append(torch.optim.AdamW(adamw_params, lr=cfg.train.adamw_lr,
+                                      weight_decay=cfg.train.weight_decay,
+                                      betas=(0.9, 0.95)))
+    if not opts:
+        raise ValueError("No trainable parameters were supplied to the optimizer")
     return opts
 
 

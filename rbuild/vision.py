@@ -15,8 +15,8 @@ Three ways to see, all user-modifiable via `VisionConfig`:
 
   vawu=True          (v3) — Video-as-Whole-Understanding: after per-frame
                      encoding (either mode), a learned query attention-pools
-                     all frames into `vawu_tokens` whole-video summary tokens
-                     that are prepended to the frame stream, so the model
+                     all frames into whole-video summary tokens that are
+                     prepended to the frame stream, so the model
                      always reads the video *as a whole* before the parts.
 
 Default remains blind: `enabled=False` builds nothing and the model is
@@ -75,6 +75,44 @@ class VaWUPooler(nn.Module):
         q = self.queries.expand(B, -1, -1)
         out, _ = self.attn(q, frame_tokens, frame_tokens, need_weights=False)
         return self.norm(out + q)
+
+
+class EncoderlessScreenshotProjector(nn.Module):
+    """Single-weight patch projector for adapted-model CUA screenshots.
+
+    This follows the encoderless vision path without constructing a second
+    vision encoder. It is used only by the CUA interface and never rewrites an
+    adapted base model's native forward/generation computation.
+    """
+
+    def __init__(self, hidden_size: int, image_size: int = 64,
+                 patch_size: int = 16, channels: int = 3):
+        super().__init__()
+        if hidden_size <= 0 or image_size <= 0 or patch_size <= 0 or channels <= 0:
+            raise ValueError("Screenshot projector dimensions must be positive")
+        if image_size % patch_size:
+            raise ValueError("Screenshot image_size must be divisible by patch_size")
+        self.hidden_size = int(hidden_size)
+        self.image_size = int(image_size)
+        self.patch_size = int(patch_size)
+        self.channels = int(channels)
+        self.patch_proj = nn.Conv2d(
+            channels, hidden_size, kernel_size=patch_size, stride=patch_size, bias=False
+        )
+
+    def forward(self, screenshots: torch.Tensor) -> torch.Tensor:
+        if screenshots.ndim == 4:
+            screenshots = screenshots.unsqueeze(1)
+        if screenshots.ndim != 5:
+            raise ValueError("Screenshots must have shape (B,C,H,W) or (B,N,C,H,W)")
+        batch, frames, channels, height, width = screenshots.shape
+        if channels != self.channels or height != self.image_size or width != self.image_size:
+            raise ValueError(
+                f"Expected {self.channels}x{self.image_size}x{self.image_size} screenshots"
+            )
+        patches = self.patch_proj(screenshots.reshape(batch * frames, channels, height, width))
+        tokens = patches.flatten(2).transpose(1, 2)
+        return tokens.reshape(batch, frames * tokens.shape[1], self.hidden_size)
 
 
 class VisionTower(nn.Module):

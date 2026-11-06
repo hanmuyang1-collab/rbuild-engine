@@ -45,14 +45,21 @@ from .config import (RBuildConfig, ModelConfig, CacheLoopConfig,
                      TrainConfig, preset)
 from .model import RBuildModel, CacheLoopLine, ParallelBundleStage
 from .memory import FastWeightMemory
-from .vision import VisionTower, VaWUPooler
+from .vision import VisionTower, VaWUPooler, EncoderlessScreenshotProjector
 from .outgen import OutGen, RendererMoE, ImageOutHead, VideoOutHead, TTSOutHead
 from .routgen import ROutGenModel, count_routgen_parameters
 from .critics import CriticExpert, CriticPanel, ACTHalting
 from .noting import NotingExperts, VerifiedNoteBuffer, SelfLearner
 from .thinking import ThinkingModes, parse_effort_tag
 from .actuation import ActionCodec, ActuationHead, Action
-from .cua import ComputerUseAgent, CUADecision, ConfirmationRequired
+from .cua import (
+    ComputerUseAgent, CUADecision, ConfirmationRequired, PolicyViolation,
+    PostconditionFailed, CUAPolicy, PolicyDriver, ShadowDriver,
+    ScreenChangeDetector, CUAReplayLedger, CUATrajectory, CUATrajectoryBuffer,
+    CUAApplicationAdapter, RECOVERY_EVENTS, DEFAULT_CUA_CANARIES,
+    build_recovery_curriculum, freeze_for_cua, run_cua_contract_canaries,
+    cua_release_gate,
+)
 from .watermark import GreenListWatermark, WatermarkDetector
 from .v4 import DiscreteDiffusionDraft, DraftVerifyDecoder, v4_release_gate
 from .v41 import (V41Config, RBuildAdaptedModel, RBuildBaseTrainer,
@@ -73,13 +80,18 @@ __all__ = [
     "WatermarkConfig", "DraftVerifyConfig", "MemoryConfig", "VisionConfig", "OutGenConfig",
     "TrainConfig", "preset",
     "RBuildModel", "CacheLoopLine", "ParallelBundleStage",
-    "FastWeightMemory", "VisionTower", "VaWUPooler",
+    "FastWeightMemory", "VisionTower", "VaWUPooler", "EncoderlessScreenshotProjector",
     "OutGen", "RendererMoE", "ImageOutHead", "VideoOutHead", "TTSOutHead",
     "ROutGenModel", "count_routgen_parameters",
     "CriticExpert", "CriticPanel", "ACTHalting",
     "NotingExperts", "VerifiedNoteBuffer", "SelfLearner",
     "ThinkingModes", "parse_effort_tag", "ActionCodec", "ActuationHead", "Action",
-    "ComputerUseAgent", "CUADecision", "ConfirmationRequired",
+    "ComputerUseAgent", "CUADecision", "ConfirmationRequired", "PolicyViolation",
+    "PostconditionFailed", "CUAPolicy", "PolicyDriver", "ShadowDriver",
+    "ScreenChangeDetector", "CUAReplayLedger", "CUATrajectory", "CUATrajectoryBuffer",
+    "CUAApplicationAdapter", "RECOVERY_EVENTS", "DEFAULT_CUA_CANARIES",
+    "build_recovery_curriculum", "freeze_for_cua", "run_cua_contract_canaries",
+    "cua_release_gate",
     "GreenListWatermark", "WatermarkDetector",
     "DiscreteDiffusionDraft", "DraftVerifyDecoder", "v4_release_gate",
     "V41Config", "RBuildAdaptedModel", "RBuildBaseTrainer",
