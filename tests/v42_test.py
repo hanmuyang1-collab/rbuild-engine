@@ -4,14 +4,13 @@ import copy
 import os
 import tempfile
 import unittest
-from unittest import mock
 
 import torch
 
+import rbuild
 from rbuild import (
     RBuildConfig,
     RBuildModel,
-    StagePLedger,
     Trainer,
     V42DataSource,
     V42DistributedConfig,
@@ -20,8 +19,7 @@ from rbuild import (
     V42Stage,
     V42StreamingData,
     V42ThroughputProfile,
-    default_v42_data_sources,
-    estimate_stage_p_cost,
+    estimate_v42_cost,
     v42_release_gate,
 )
 
@@ -64,13 +62,28 @@ def clone_config(cfg):
 
 def tiny_ladder(cfg=None, production=False):
     cfg = cfg or tiny_config()
-    stages = [V42Stage(name, clone_config(cfg), max_steps=cfg.train.max_steps)
-              for name in ("A", "B", "C", "D")]
-    if production:
-        final = V42Stage("P", clone_config(cfg), max_steps=cfg.train.max_steps)
-        return V42Ladder(stages + [final], production=True)
-    return V42Ladder(stages + [V42Stage("E", clone_config(cfg),
-                                       max_steps=cfg.train.max_steps)])
+    return V42Ladder([
+        V42Stage(name, clone_config(cfg), max_steps=cfg.train.max_steps)
+        for name in ("custom-a", "custom-b")
+    ], production=production)
+
+
+def custom_distributed(**overrides):
+    values = dict(
+        nodes=2,
+        gpus_per_node=4,
+        gpu_vram_gb=80,
+        tensor_parallel=2,
+        n_experts=4,
+        expert_parallel=8,
+        expert_replicas=2,
+        expert_placements_per_node=4,
+        max_context=1024,
+        interconnect="test-fabric",
+        intranode_interconnect="test-link",
+    )
+    values.update(overrides)
+    return V42DistributedConfig(**values)
 
 
 def batches():
@@ -79,71 +92,73 @@ def batches():
     return [(x, y)]
 
 
-class V42LedgerTests(unittest.TestCase):
-    def test_locked_stage_p_math(self):
-        ledger = StagePLedger()
-        ledger.validate()
-        self.assertEqual(ledger.total_params, 820_000_000_000)
-        self.assertEqual(ledger.active_expert_params, 82_000_000_000)
-        self.assertEqual(ledger.active_expert_params * 10, ledger.total_params)
-        ledger.params_per_expert = 51_250_000_000
-        with self.assertRaises(ValueError):
-            ledger.validate()
-
-    def test_h200_layout_and_memory(self):
-        distributed = V42DistributedConfig()
+class V42CallerConfigurationTests(unittest.TestCase):
+    def test_custom_distributed_layout_memory_and_json(self):
+        distributed = custom_distributed()
         distributed.validate()
-        self.assertEqual(distributed.gpu_count, 128)
+        self.assertEqual(distributed.gpu_count, 8)
         placements = distributed.expert_placements()
-        self.assertEqual(len(placements), 16)
-        self.assertTrue(all(len(items) == 2 for items in placements.values()))
-        for expert in range(16):
+        self.assertEqual(len(placements), 2)
+        self.assertTrue(all(len(items) == 4 for items in placements.values()))
+        for expert in range(4):
             roles = [item["role"] for items in placements.values()
                      for item in items if item["expert"] == expert]
             self.assertEqual(sorted(roles), ["primary", "replica"])
-        memory = distributed.memory_ledger()
-        self.assertEqual(memory.aggregate_vram_gb, 18_048)
-        self.assertEqual(memory.training_resident_gb, 13_120)
-        self.assertEqual(memory.remaining_activation_budget_gb, 4_928)
-        self.assertEqual(memory.training_resident_per_gpu_gb, 102.5)
+        memory = distributed.memory_ledger(1_000_000_000)
+        self.assertEqual(memory.aggregate_vram_gb, 640)
+        self.assertEqual(memory.training_resident_gb, 16)
+        self.assertEqual(memory.remaining_activation_budget_gb, 624)
+        self.assertEqual(memory.training_resident_per_gpu_gb, 2)
         command = distributed.torchrun_command(
-            "examples/train_scratch_v42.py", 3, "10.0.0.1", ["--dry-run"]
+            "examples/train_scratch_v42.py", 1, "10.0.0.1", ["--dry-run"]
         )
-        self.assertIn("--node-rank=3", command)
-        self.assertIn("--nproc-per-node=8", command)
+        self.assertIn("--node-rank=1", command)
+        self.assertIn("--nproc-per-node=4", command)
         self.assertEqual(command[-1], "--dry-run")
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "plan.json")
+            distributed.save(path)
+            self.assertEqual(V42DistributedConfig.load(path).to_dict(),
+                             distributed.to_dict())
 
-    def test_10m_context_and_ep_guards(self):
-        distributed = V42DistributedConfig(full_activation_recompute=False)
+    def test_context_and_expert_guards_use_caller_dimensions(self):
         with self.assertRaises(ValueError):
-            distributed.validate()
-        distributed = V42DistributedConfig(expert_parallel=16)
+            custom_distributed(max_context=10_000_000,
+                               full_activation_recompute=False).validate()
         with self.assertRaises(ValueError):
-            distributed.validate()
+            custom_distributed(expert_parallel=4).validate()
+        with self.assertRaises(ValueError):
+            custom_distributed(expert_placements_per_node=3).validate()
 
-    def test_two_column_cost_requires_explicit_assumptions(self):
-        result = estimate_stage_p_cost(
-            1_000_000_000,
-            V42ThroughputProfile(2.0, 100.0, efficiency=0.5),
-            V42ThroughputProfile(2.0, 400.0, efficiency=0.75),
+    def test_two_column_cost_uses_explicit_sizes_and_hardware(self):
+        result = estimate_v42_cost(
+            total_tokens=1_000_000_000,
+            total_params=1_000_000,
+            active_params=200_000,
+            naive=V42ThroughputProfile(2.0, 100.0, efficiency=0.5),
+            optimized=V42ThroughputProfile(2.0, 400.0, efficiency=0.75),
+            distributed=custom_distributed(),
         )
         self.assertIn("naive", result)
         self.assertIn("optimized", result)
+        self.assertEqual(result["naive"]["flops_per_token"], 6_000_000)
+        self.assertEqual(result["optimized"]["flops_per_token"], 1_200_000)
         self.assertGreater(result["naive"]["cost_usd"], result["optimized"]["cost_usd"])
         self.assertIn("speedup_x", result)
 
 
 class V42LadderTests(unittest.TestCase):
-    def test_open_intermediate_sizes_survive_json(self):
-        ladder = V42Ladder.production_ladder([V42Stage(str(i)) for i in range(4)])
+    def test_open_caller_ladder_survives_json_without_fixed_stage_count(self):
+        ladder = V42Ladder([V42Stage("only-stage", total_params=123, active_params=45)])
         ladder.validate()
-        self.assertIsNone(ladder.stages[0].config)
         with tempfile.TemporaryDirectory() as root:
             path = os.path.join(root, "ladder.json")
             ladder.save(path)
             restored = V42Ladder.load(path)
-        self.assertTrue(restored.production)
-        self.assertEqual(restored.stages[-1].total_params, 820_000_000_000)
+        self.assertEqual(len(restored.stages), 1)
+        self.assertEqual(restored.stages[0].name, "only-stage")
+        self.assertEqual(restored.stages[0].total_params, 123)
+        self.assertEqual(restored.stages[0].active_params, 45)
         with self.assertRaises(ValueError):
             restored.validate(allow_open=False)
 
@@ -153,16 +168,26 @@ class V42LadderTests(unittest.TestCase):
         self.assertEqual(sum(p.numel() for p in model.parameters()),
                          cfg.count_parameters()["total_params"])
 
-    def test_production_stage_p_config_cannot_contradict_ledger(self):
+    def test_custom_production_weights_are_accepted_but_declarations_must_match(self):
         ladder = tiny_ladder(production=True)
-        with self.assertRaisesRegex(ValueError, "820B"):
+        ladder.validate(allow_open=False)
+        ladder.stages[-1].total_params = (
+            ladder.stages[-1].config.count_parameters()["total_params"] + 1
+        )
+        with self.assertRaisesRegex(ValueError, "declared total params"):
             ladder.validate()
+
+    def test_v42_preset_apis_are_removed(self):
+        self.assertFalse(hasattr(V42Ladder, "production_ladder"))
+        self.assertFalse(hasattr(rbuild, "StagePLedger"))
+        self.assertFalse(hasattr(rbuild, "estimate_stage_p_cost"))
+        self.assertFalse(hasattr(rbuild, "default_v42_data_sources"))
 
     def test_release_gate_reuses_v41_preservation(self):
         output = torch.tensor([[1.0, 2.0]])
         ladder = tiny_ladder()
         gate = v42_release_gate(output, output, 1.0, 1.0,
-                                ladder=ladder, distributed=V42DistributedConfig())
+                                ladder=ladder, distributed=custom_distributed())
         self.assertTrue(gate["passed"])
         self.assertFalse(v42_release_gate(output, output, 1.0, 0.9,
                                           ladder=ladder)["passed"])
@@ -171,13 +196,18 @@ class V42LadderTests(unittest.TestCase):
 
 
 class V42DataTests(unittest.TestCase):
-    def test_default_mix_has_exactly_one_math_source(self):
-        sources = default_v42_data_sources("megamath")
-        self.assertEqual(len(sources), 4)
-        self.assertEqual(sum(source.name == "math" for source in sources), 1)
-        self.assertEqual(sources[2].dataset, "LLM360/MegaMath")
-        with self.assertRaises(ValueError):
-            default_v42_data_sources("both")
+    def test_data_mix_is_explicitly_caller_defined(self):
+        sources = [
+            V42DataSource("mine", "my-org/my-data", weight=3.0),
+            V42DataSource("other", "my-org/other-data", weight=0.5),
+        ]
+        stream = V42StreamingData(sources, loaders={
+            "mine": lambda: iter([{"text": "a"}]),
+            "other": lambda: iter([{"text": "b"}]),
+        })
+        self.assertEqual([source.dataset for source in stream.sources],
+                         ["my-org/my-data", "my-org/other-data"])
+        self.assertEqual(sorted(stream.rows()), ["a", "b"])
 
     def test_admission_filter_runs_before_batches(self):
         source = V42DataSource(
@@ -192,15 +222,13 @@ class V42DataTests(unittest.TestCase):
             ])},
         )
         self.assertEqual(list(stream.rows()), ["keep one", "keep two"])
-        cfg = tiny_config()
-        batch = next(iter(stream.batches(cfg)))
+        batch = next(iter(stream.batches(tiny_config())))
         self.assertEqual(batch[0].shape, (1, 16))
         self.assertEqual(batch[1].shape, (1, 16))
 
     def test_production_data_requires_license_and_filter(self):
         with self.assertRaises(ValueError):
-            V42StreamingData([V42DataSource("code", "bigcode/the-stack-v2")],
-                             production=True)
+            V42StreamingData([V42DataSource("code", "caller/data")], production=True)
 
 
 class V42ScratchTrainingTests(unittest.TestCase):
@@ -244,14 +272,12 @@ class V42ScratchTrainingTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "growth_fn"):
                 runner.run_stage(1, batches(), root)
 
-    def test_production_stage_p_requires_sharding_and_release_evidence(self):
+    def test_production_final_stage_requires_sharding_and_release_evidence(self):
         ladder = tiny_ladder(production=True)
-        # Isolate the runtime guard; the ledger/config contradiction is tested above.
-        with mock.patch.object(V42Ladder, "validate", lambda self, allow_open=True: None):
-            runner = V42ScratchTrainer(ladder, device="cpu", log_fn=None)
-            with tempfile.TemporaryDirectory() as root:
-                with self.assertRaisesRegex(RuntimeError, "sharding wrap_fn"):
-                    runner.run_stage(4, batches(), root)
+        runner = V42ScratchTrainer(ladder, device="cpu", log_fn=None)
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaisesRegex(RuntimeError, "sharding wrap_fn"):
+                runner.run_stage(1, batches(), root)
 
 
 if __name__ == "__main__":
