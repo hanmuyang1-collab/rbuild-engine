@@ -1,14 +1,12 @@
-"""R-Build v4.2: progressive from-scratch training beside the V4.1 route.
+"""R-Build v4.2: interactive progressive training beside the V4.1 route.
 
 V4.2 adds orchestration, validation, data admission, and distributed launch
 contracts. It deliberately adds no modules or parameters to ``RBuildModel`` and
 does not alter V4.1's exact base-model delegation.
 
-The production ladder has five stages. Only Stage P is numerically locked:
-16 experts x 41B + 164B shared = 820B total, with Top-2 routing activating
-82B expert parameters. The first four stages remain caller-defined. A shape
-change between stages requires an explicit growth function; weights are never
-silently reset.
+There are no built-in V4.2 weight, ladder, hardware, or data-mix presets. Caller
+scripts define every stage and runtime plan. A shape change between stages
+requires an explicit growth function; weights are never silently reset.
 """
 
 from __future__ import annotations
@@ -32,45 +30,8 @@ from .v41 import v41_release_gate
 
 
 # --------------------------------------------------------------------------- #
-# Locked Stage-P parameter and memory ledgers
+# Caller-sized memory ledger
 # --------------------------------------------------------------------------- #
-
-@dataclass
-class StagePLedger:
-    """The user-locked Stage-P parameter invariant; all counts are exact."""
-
-    n_experts: int = 16
-    params_per_expert: int = 41_000_000_000
-    shared_params: int = 164_000_000_000
-    expert_top_k: int = 2
-
-    @property
-    def total_params(self) -> int:
-        return self.n_experts * self.params_per_expert + self.shared_params
-
-    @property
-    def active_expert_params(self) -> int:
-        return self.expert_top_k * self.params_per_expert
-
-    def validate(self) -> None:
-        if self.n_experts != 16 or self.params_per_expert != 41_000_000_000:
-            raise ValueError("Stage P is locked to 16 experts of exactly 41B parameters")
-        if self.shared_params != 164_000_000_000 or self.total_params != 820_000_000_000:
-            raise ValueError("Stage P is locked to 164B shared and 820B total parameters")
-        if self.expert_top_k != 2 or self.active_expert_params != 82_000_000_000:
-            raise ValueError("Stage P is locked to Top-2 routing and 82B active expert params")
-
-    def to_dict(self) -> dict:
-        return {
-            **asdict(self),
-            "total_params": self.total_params,
-            "active_expert_params": self.active_expert_params,
-            "shared_components": [
-                "attention", "embeddings", "routers", "V3 critics",
-                "draft-verify", "fast-weight projections",
-            ],
-        }
-
 
 @dataclass
 class V42MemoryLedger:
@@ -131,7 +92,7 @@ class V42MemoryLedger:
 
 
 # --------------------------------------------------------------------------- #
-# Five-stage ladder
+# Caller-defined progressive ladder
 # --------------------------------------------------------------------------- #
 
 @dataclass
@@ -187,52 +148,28 @@ class V42Stage:
 
 @dataclass
 class V42Ladder:
+    """A caller-defined progressive ladder; no stage names or sizes are preset."""
+
     stages: List[V42Stage]
     production: bool = False
 
     def validate(self, allow_open: bool = True) -> None:
-        if len(self.stages) != 5:
-            raise ValueError("V4.2 requires exactly five progressive stages")
-        if len({stage.name for stage in self.stages}) != 5:
+        if not self.stages:
+            raise ValueError("V4.2 requires at least one caller-defined stage")
+        if len({stage.name for stage in self.stages}) != len(self.stages):
             raise ValueError("V4.2 stage names must be unique")
         for stage in self.stages:
             stage.validate()
         if not allow_open and any(stage.config is None for stage in self.stages):
             open_names = [stage.name for stage in self.stages if stage.config is None]
             raise ValueError(f"Open V4.2 stages need explicit model configs: {open_names}")
-        if self.production:
-            final = self.stages[-1]
-            if final.name != "P":
-                raise ValueError("The production ladder must end at Stage P")
-            ledger = StagePLedger()
-            ledger.validate()
-            if final.total_params not in (None, ledger.total_params):
-                raise ValueError("Stage P total parameters violate the locked 820B ledger")
-            if final.active_params not in (None, ledger.active_expert_params):
-                raise ValueError("Stage P active parameters violate the locked 82B ledger")
-            if (final.config is not None
-                    and final.config.count_parameters()["total_params"] != ledger.total_params):
-                raise ValueError("Stage P model config contradicts the locked 820B ledger")
-
-    @classmethod
-    def production_ladder(cls, first_four: Sequence[V42Stage]) -> "V42Ladder":
-        if len(first_four) != 4:
-            raise ValueError("Supply exactly four caller-defined stages before Stage P")
-        ledger = StagePLedger()
-        ladder = cls(
-            list(first_four) + [V42Stage(
-                "P", total_params=ledger.total_params,
-                active_params=ledger.active_expert_params,
-            )],
-            production=True,
-        )
-        ladder.validate()
-        return ladder
 
     def index(self, name_or_index) -> int:
         if isinstance(name_or_index, int):
-            if not 0 <= name_or_index < 5:
-                raise IndexError("V4.2 stage index must be in [0, 4]")
+            if not 0 <= name_or_index < len(self.stages):
+                raise IndexError(
+                    f"V4.2 stage index must be in [0, {len(self.stages) - 1}]"
+                )
             return name_or_index
         for index, stage in enumerate(self.stages):
             if stage.name == name_or_index:
@@ -259,7 +196,7 @@ class V42Ladder:
 
     def report(self) -> str:
         self.validate()
-        lines = ["R-Build v4.2 five-stage scratch ladder", "=" * 52]
+        lines = ["R-Build v4.2 caller-defined scratch ladder", "=" * 52]
         for index, stage in enumerate(self.stages):
             counts = stage.resolved_counts()
             total = counts.get("total_params")
@@ -270,50 +207,50 @@ class V42Ladder:
                 f"  {index + 1}. {stage.name}: total={total_text}, active={active_text}, "
                 f"config={'ready' if stage.config is not None else 'open'}"
             )
-        if self.production:
-            memory = V42MemoryLedger(StagePLedger().total_params, 128, 141)
-            lines.extend([
-                "-" * 52,
-                f"  Stage-P training residency: {memory.training_resident_gb:,.0f} GB",
-                f"  Remaining activation/KV budget: "
-                f"{memory.remaining_activation_budget_gb:,.0f} GB",
-            ])
         return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
-# 128x H200 distributed plan
+# Caller-defined distributed plan
 # --------------------------------------------------------------------------- #
 
 @dataclass
 class V42DistributedConfig:
-    nodes: int = 16
-    gpus_per_node: int = 8
-    gpu_vram_gb: int = 141
-    tensor_parallel: int = 4
-    expert_parallel: int = 32
-    expert_replicas: int = 2
-    expert_placements_per_node: int = 2
-    max_context: int = 10_000_000
+    """Distributed dimensions supplied by the caller, with no hardware preset."""
+
+    nodes: int
+    gpus_per_node: int
+    gpu_vram_gb: int
+    tensor_parallel: int
+    n_experts: int
+    expert_parallel: int
+    expert_replicas: int
+    expert_placements_per_node: int
+    max_context: int
     flash_attention_3: bool = True
     full_activation_recompute: bool = True
     context_parallel: bool = True
     kv_tiers: Sequence[str] = ("gpu", "cpu", "nvme")
     fast_weight_tiers: Sequence[str] = ("gpu", "cpu", "nvme")
-    interconnect: str = "NDR 800G InfiniBand"
-    intranode_interconnect: str = "NVLink"
+    interconnect: str = ""
+    intranode_interconnect: str = ""
 
     @property
     def gpu_count(self) -> int:
         return self.nodes * self.gpus_per_node
 
-    def validate(self, production: bool = True) -> None:
+    def validate(self) -> None:
         if min(self.nodes, self.gpus_per_node, self.gpu_vram_gb,
-               self.tensor_parallel, self.expert_parallel,
-               self.expert_replicas, self.expert_placements_per_node) <= 0:
+               self.tensor_parallel, self.n_experts, self.expert_parallel,
+               self.expert_replicas, self.expert_placements_per_node,
+               self.max_context) <= 0:
             raise ValueError("Distributed dimensions must be positive")
         if self.gpus_per_node % self.tensor_parallel:
             raise ValueError("TP groups must fit wholly inside each node")
+        if self.expert_parallel != self.n_experts * self.expert_replicas:
+            raise ValueError("EP must equal caller-defined experts times replicas")
+        if self.nodes * self.expert_placements_per_node != self.expert_parallel:
+            raise ValueError("Expert placements per node must cover EP exactly")
         if tuple(self.kv_tiers) != ("gpu", "cpu", "nvme"):
             raise ValueError("KV must use the GPU/CPU/NVMe hierarchy")
         if tuple(self.fast_weight_tiers) != ("gpu", "cpu", "nvme"):
@@ -324,38 +261,48 @@ class V42DistributedConfig:
             raise ValueError(
                 "10M context requires FA3, full activation recompute, and context sharding"
             )
-        if production:
-            ledger = StagePLedger()
-            if (self.nodes, self.gpus_per_node, self.gpu_count,
-                    self.gpu_vram_gb) != (16, 8, 128, 141):
-                raise ValueError("Stage P is locked to 16 nodes x 8 H200 141GB GPUs")
-            if self.tensor_parallel != 4:
-                raise ValueError("Stage P attention/critics/fast weights use node-local TP=4")
-            expected_ep = ledger.n_experts * self.expert_replicas
-            if self.expert_replicas != 2 or self.expert_parallel != expected_ep:
-                raise ValueError("Stage P EP=32 comes from two replicas of each of 16 experts")
-            if (self.expert_placements_per_node != 2
-                    or self.nodes * self.expert_placements_per_node != self.expert_parallel):
-                raise ValueError("Stage P requires exactly two expert placements per node")
 
     def expert_placements(self) -> Dict[int, List[dict]]:
-        """One primary per node plus a replica eight nodes away."""
+        """Place caller-defined experts and replicas round-robin across nodes."""
         self.validate()
         placement = {node: [] for node in range(self.nodes)}
-        for expert in range(StagePLedger().n_experts):
-            primary = expert
-            replica = (expert + self.nodes // 2) % self.nodes
-            placement[primary].append({"expert": expert, "role": "primary"})
-            placement[replica].append({"expert": expert, "role": "replica"})
+        for expert in range(self.n_experts):
+            for replica_index in range(self.expert_replicas):
+                node = (expert * self.expert_replicas + replica_index) % self.nodes
+                placement[node].append({
+                    "expert": expert,
+                    "role": "primary" if replica_index == 0 else "replica",
+                })
         return placement
 
-    def memory_ledger(self) -> V42MemoryLedger:
+    def memory_ledger(self, total_params: int) -> V42MemoryLedger:
+        """Size memory from the caller's model, never from a built-in weight count."""
         self.validate()
-        ledger = V42MemoryLedger(
-            StagePLedger().total_params, self.gpu_count, self.gpu_vram_gb
-        )
+        ledger = V42MemoryLedger(total_params, self.gpu_count, self.gpu_vram_gb)
         ledger.validate()
         return ledger
+
+    def to_dict(self) -> dict:
+        self.validate()
+        raw = asdict(self)
+        raw["kv_tiers"] = list(self.kv_tiers)
+        raw["fast_weight_tiers"] = list(self.fast_weight_tiers)
+        return raw
+
+    @classmethod
+    def from_dict(cls, raw: Mapping) -> "V42DistributedConfig":
+        plan = cls(**dict(raw))
+        plan.validate()
+        return plan
+
+    def save(self, path: str) -> None:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(self.to_dict(), handle, indent=2)
+
+    @classmethod
+    def load(cls, path: str) -> "V42DistributedConfig":
+        with open(path, encoding="utf-8") as handle:
+            return cls.from_dict(json.load(handle))
 
     def nccl_environment(self) -> Dict[str, str]:
         """Portable defaults; fabric-specific tuning remains user-overridable."""
@@ -396,7 +343,7 @@ class V42DistributedConfig:
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         if world_size != self.gpu_count:
             raise RuntimeError(
-                f"Stage P expects WORLD_SIZE={self.gpu_count}, got {world_size}"
+                f"Distributed plan expects WORLD_SIZE={self.gpu_count}, got {world_size}"
             )
         if not torch.cuda.is_available():
             raise RuntimeError("The production distributed plan requires CUDA")
@@ -426,28 +373,29 @@ class V42ThroughputProfile:
             raise ValueError("flops_per_token must be positive")
 
 
-def estimate_stage_p_cost(
+def estimate_v42_cost(
     total_tokens: int,
+    total_params: int,
+    active_params: int,
     naive: V42ThroughputProfile,
     optimized: V42ThroughputProfile,
-    distributed: Optional[V42DistributedConfig] = None,
+    distributed: V42DistributedConfig,
 ) -> Dict[str, dict]:
-    """Compute-only naive-vs-optimized estimate; no grant or price is assumed.
+    """Compute naive/optimized costs from caller-supplied sizes and hardware.
 
-    By default the naive column uses dense 6*820B FLOPs/token and the optimized
-    column uses 6*82B. Callers can replace either with measured end-to-end
-    FLOPs/token, which is preferable because shared layers and recomputation are
-    not captured by the routed-expert parameter invariant.
+    The first-order defaults are dense 6*total_params and 6*active_params
+    FLOPs/token. Either profile can override these with measured end-to-end
+    FLOPs/token. No model size, GPU count, grant, or price is assumed.
     """
-    if total_tokens <= 0:
-        raise ValueError("total_tokens must be positive")
-    distributed = distributed or V42DistributedConfig()
+    if total_tokens <= 0 or total_params <= 0 or active_params <= 0:
+        raise ValueError("Token and parameter counts must be positive")
+    if active_params > total_params:
+        raise ValueError("active_params cannot exceed total_params")
     distributed.validate()
-    ledger = StagePLedger()
     result = {}
     for name, profile, default_params in (
-        ("naive", naive, ledger.total_params),
-        ("optimized", optimized, ledger.active_expert_params),
+        ("naive", naive, total_params),
+        ("optimized", optimized, active_params),
     ):
         profile.validate()
         flops_per_token = profile.flops_per_token or 6.0 * default_params
@@ -499,27 +447,6 @@ class V42DataSource:
             raise ValueError(f"{self.name}: dataset license has not been approved")
         if production and self.admission_filter is None:
             raise ValueError(f"{self.name}: production ingestion requires an admission filter")
-
-
-def default_v42_data_sources(math_source: str = "finemath") -> List[V42DataSource]:
-    """Return the four-source mix with exactly one mathematics source.
-
-    These are dataset identifiers, not license approvals. Production validation
-    stays closed until callers attach reviewed license decisions and row-level
-    license/PII admission filters, especially for The Stack v2.
-    """
-    math = {
-        "finemath": "HuggingFaceTB/finemath",
-        "megamath": "LLM360/MegaMath",
-    }
-    if math_source not in math:
-        raise ValueError("Choose exactly one math source: 'finemath' or 'megamath'")
-    return [
-        V42DataSource("base", "HuggingFaceFW/fineweb-edu", weight=4.0),
-        V42DataSource("anchor", "allenai/dolma", weight=2.0),
-        V42DataSource("math", math[math_source], weight=1.0),
-        V42DataSource("code", "bigcode/the-stack-v2", weight=1.0),
-    ]
 
 
 class _V42BatchIterable:
@@ -723,7 +650,7 @@ class V42StageTrainer(Trainer):
 
 
 class V42ScratchTrainer:
-    """Build and advance a five-stage ladder without implicit reinitialization.
+    """Build and advance a caller-defined ladder without implicit reinitialization.
 
     ``growth_fn(previous_model, current_model)`` is mandatory when adjacent
     stages have different state-dict geometry. It must perform the intended
@@ -775,11 +702,15 @@ class V42ScratchTrainer:
         index = self.ladder.index(name_or_index)
         stage = self.ladder.stages[index]
         assert stage.config is not None
-        if self.ladder.production and index == 4:
+        if self.ladder.production and index == len(self.ladder.stages) - 1:
             if self.wrap_fn is None:
-                raise RuntimeError("Stage P requires an explicit TP/EP/CP sharding wrap_fn")
+                raise RuntimeError(
+                    "The production final stage requires an explicit sharding wrap_fn"
+                )
             if self.release_evaluator is None:
-                raise RuntimeError("Stage P requires the V4.1-compatible release evaluator")
+                raise RuntimeError(
+                    "The production final stage requires a V4.1-compatible release evaluator"
+                )
 
         stage_dir = os.path.join(output_dir, stage.name)
         if resume_checkpoint is not None:
@@ -844,7 +775,7 @@ class V42ScratchTrainer:
             start_stage=0, resume_checkpoint: Optional[str] = None) -> List[dict]:
         start = self.ladder.index(start_stage)
         results = []
-        for index in range(start, 5):
+        for index in range(start, len(self.ladder.stages)):
             stage = self.ladder.stages[index]
             results.append(self.run_stage(
                 index, batches_by_stage[stage.name], output_dir,
@@ -876,7 +807,7 @@ def v42_release_gate(
             errors.append(str(exc))
     if distributed is not None:
         try:
-            distributed.validate(production=ladder.production if ladder else True)
+            distributed.validate()
         except (ValueError, AssertionError) as exc:
             distributed_ok = False
             errors.append(str(exc))

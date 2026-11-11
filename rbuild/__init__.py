@@ -2,8 +2,9 @@
 R-Build v4.2 — a fully user-modifiable, open-source architecture and
 training-speed engine. Non-destructive adapters convert any pretrained base
 into an R-Build system with continued pretraining and supervised fine-tuning;
-a five-stage from-scratch ladder now runs beside that route without changing
-the complete v4 draft-verify and v3 expert/memory/media capabilities.
+a caller-defined from-scratch ladder now runs beside that route without changing
+the complete v4 draft-verify and v3 expert/memory/media capabilities. V4.2 has
+no built-in weight, ladder, hardware, or data-mix presets.
 
 v3.1 merges R-Run into this repo: the `rrun` package serves any R-Build
 checkpoint with one command and hot-swaps the resident model with zero
@@ -66,10 +67,9 @@ from .v4 import DiscreteDiffusionDraft, DraftVerifyDecoder, v4_release_gate
 from .v41 import (V41Config, RBuildAdaptedModel, RBuildBaseTrainer,
                   continued_pretraining_batches, supervised_fine_tuning_batches,
                   v41_release_gate)
-from .v42 import (StagePLedger, V42MemoryLedger, V42Stage, V42Ladder,
+from .v42 import (V42MemoryLedger, V42Stage, V42Ladder,
                   V42DistributedConfig, V42ThroughputProfile,
-                  estimate_stage_p_cost, V42DataSource,
-                  default_v42_data_sources, V42StreamingData,
+                  estimate_v42_cost, V42DataSource, V42StreamingData,
                   V42StageTrainer, V42ScratchTrainer, v42_release_gate)
 from .optim import Muon, WSDScheduler, build_optimizer
 from .data import (load_manifest, manifest_batches, hf_image_batches,
@@ -102,9 +102,9 @@ __all__ = [
     "DiscreteDiffusionDraft", "DraftVerifyDecoder", "v4_release_gate",
     "V41Config", "RBuildAdaptedModel", "RBuildBaseTrainer",
     "continued_pretraining_batches", "supervised_fine_tuning_batches", "v41_release_gate",
-    "StagePLedger", "V42MemoryLedger", "V42Stage", "V42Ladder",
-    "V42DistributedConfig", "V42ThroughputProfile", "estimate_stage_p_cost",
-    "V42DataSource", "default_v42_data_sources", "V42StreamingData",
+    "V42MemoryLedger", "V42Stage", "V42Ladder",
+    "V42DistributedConfig", "V42ThroughputProfile", "estimate_v42_cost",
+    "V42DataSource", "V42StreamingData",
     "V42StageTrainer", "V42ScratchTrainer", "v42_release_gate",
     "Muon", "WSDScheduler", "build_optimizer", "Trainer", "interactive",
     "load_manifest", "manifest_batches", "hf_image_batches",

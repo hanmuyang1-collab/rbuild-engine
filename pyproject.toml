@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rbuild-engine"
 version = "4.2.0"
-description = "R-Build v4.2: five-stage from-scratch training beside non-destructive V4.1 conversion, CPT and SFT, with universal CUA, V4 draft-verify, V3 experts, memory, media, and R-Run."
+description = "R-Build v4.2: caller-defined from-scratch training beside non-destructive V4.1 conversion, CPT and SFT, with universal CUA, V4 draft-verify, V3 experts, memory, media, and R-Run."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -19,7 +19,7 @@ dependencies = [
 notebook = ["ipywidgets>=8.0"]
 train = ["transformers>=4.40", "datasets>=2.18"]
 serve = ["fastapi>=0.110", "uvicorn>=0.29", "pydantic>=2.0"]
-vllm = ["vllm>=0.6"]
+vllm = ["vllm>=0.6.0"]
 dev = ["ipywidgets>=8.0", "transformers>=4.40", "datasets>=2.18",
        "fastapi>=0.110", "uvicorn>=0.29", "pydantic>=2.0"]
 
