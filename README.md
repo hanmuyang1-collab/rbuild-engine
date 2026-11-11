@@ -1,6 +1,6 @@
 # R-Build v4.2
 
-**A fully user-modifiable, open-source architecture + training-speed engine — with a five-stage from-scratch ladder running beside non-destructive pretrained conversion, continued pretraining, and supervised fine-tuning, while retaining exact-AR draft–verify decoding, self-governing, and self-serving.**
+**A fully user-modifiable, open-source architecture + training-speed engine — with a caller-defined from-scratch ladder running beside non-destructive pretrained conversion, continued pretraining, and supervised fine-tuning, while retaining exact-AR draft–verify decoding, self-governing, and self-serving.**
 Every knob is yours: programmatically, through an interactive widget panel in
 Colab/Jupyter, or a console prompt anywhere else.
 
@@ -9,49 +9,51 @@ R-Run serves them. One repo, one engine: `rrun serve` / `rrun swap`.
 
 ## What's new in v4.2
 
-V4.2 restores **from-scratch training without removing V4.1**. `V42Ladder` holds
-exactly five progressive stages; `V42ScratchTrainer` initializes the first stage,
-strictly transfers matching weights between stages, requires an explicit
+V4.2 restores **from-scratch training without removing V4.1**, with no built-in
+weight, ladder, hardware, or data-mix presets. Your script supplies any nonempty
+stage list and every `RBuildConfig`. `V42ScratchTrainer` initializes the first
+stage, strictly transfers matching weights between stages, requires an explicit
 `growth_fn` for geometry changes, and resumes model, fast-weight, optimizer, and
 scheduler-step state. No stage is silently reinitialized.
 
-The production ladder ends at the locked **Stage P: 16 × 41B experts + 164B
-shared = 820B total; Top-2 routing activates 82B expert parameters**. The four
-intermediate stage sizes remain caller-defined and serialize as open until
-configured. The distributed plan validates 128× H200 (16 nodes × 8), node-local
-TP=4, EP=32 through two replicas per expert, replica-aware placement, and the
-FA3 + full-recompute + context-sharding contract for 10M context.
-
 ```python
-from rbuild import V42Ladder, V42ScratchTrainer
+from rbuild import V42Ladder, V42ScratchTrainer, V42Stage
 
-ladder = V42Ladder.load("ladder.json")       # five configured stages
+# Define and modify cfg_a/cfg_b in your script; no model size is imposed.
+ladder = V42Ladder([
+    V42Stage("my-first-stage", cfg_a),
+    V42Stage("my-second-stage", cfg_b),
+])
 print(ladder.report())
 runner = V42ScratchTrainer(ladder)           # strict same-geometry transfer
 runner.run_stage(0, stage_a_batches, "ckpt_v42")
 runner.run_stage(1, stage_b_batches, "ckpt_v42")
 ```
 
-`V42StreamingData` concurrently mixes FineWeb-Edu, Dolma, exactly one of
-FineMath/MegaMath, and The Stack v2 using bounded Hugging Face streams.
-Production ingestion requires explicit license approval and row-level admission
-filters before tokenization. `estimate_stage_p_cost()` always returns naive and
-optimized columns from explicit throughput and price assumptions.
+`V42DistributedConfig` requires caller-supplied hardware, TP, expert, replica,
+placement, and context dimensions. `plan.memory_ledger(total_params)` and
+`estimate_v42_cost()` likewise use explicit model sizes. Cost reports always
+include naive and optimized columns from explicit throughput and price assumptions.
 
-Stage P is an implementation plan, not a claim of completed 820B training. It
-requires an explicit TP/EP/CP `wrap_fn` and release evaluator; the portable
-example refuses to substitute ordinary DDP. V4.2 adds no model modules or
-parameters, and `v42_release_gate()` reuses V4.1's exact-output and capability
-preservation checks.
+`V42StreamingData` mixes only the `V42DataSource` objects supplied by your script,
+using bounded Hugging Face streams. Production ingestion requires explicit
+license approval and row-level admission filters before tokenization.
+
+Setting `production=True` enables final-stage sharding and release-evidence
+requirements; it does not select a model or hardware preset. V4.2 adds no model
+modules or parameters, and `v42_release_gate()` reuses V4.1's exact-output and
+capability preservation checks.
 
 ```bash
-python examples/train_scratch_v42.py --ladder ladder.json --data-dir data --stage A
-python examples/train_scratch_v42.py --ladder production.json --dry-run
+python examples/train_scratch_v42.py --ladder ladder.json --data-dir data --stage my-first-stage
+python examples/train_scratch_v42.py --ladder ladder.json --dry-run
+python examples/launch_v42.py --plan plan.json --node-rank 0 --master-addr 10.0.0.10 \
+    --script examples/train_scratch_v42.py --print-only -- --ladder ladder.json
 PYTHONPATH=. python3 tests/v42_test.py
 ```
 
-See **R-Build-V4.2-DESIGN.md** for the memory ledger, expert placement, data
-admission contract, launch helper, cost assumptions, and production boundaries.
+See **R-Build-V4.2-DESIGN.md** for caller-defined plans, the memory ledger,
+expert placement, data admission contract, launch helper, and cost assumptions.
 
 ## What's new in v4.1
 
