@@ -19,7 +19,7 @@ dependencies = [
 notebook = ["ipywidgets>=8.0"]
 train = ["transformers>=4.40", "datasets>=2.18"]
 serve = ["fastapi>=0.110", "uvicorn>=0.29", "pydantic>=2.0"]
-vllm = ["vllm>=0.6.0"]
+vllm = ["vllm>=0.6"]
 dev = ["ipywidgets>=8.0", "transformers>=4.40", "datasets>=2.18",
        "fastapi>=0.110", "uvicorn>=0.29", "pydantic>=2.0"]
 
