@@ -12,6 +12,7 @@ requires an explicit growth function; weights are never silently reset.
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import random
@@ -373,6 +374,50 @@ class V42ThroughputProfile:
             raise ValueError("flops_per_token must be positive")
 
 
+@dataclass(frozen=True)
+class V42CostTarget:
+    """Reference budget target; the default is approximately $300K to $120K."""
+
+    baseline_usd: float = 300_000.0
+    target_usd: float = 120_000.0
+    tolerance: float = 0.05
+
+    def validate(self) -> None:
+        values = (self.baseline_usd, self.target_usd, self.tolerance)
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("Cost-target values must be finite")
+        if self.baseline_usd <= 0 or self.target_usd <= 0:
+            raise ValueError("Cost-target budgets must be positive")
+        if self.target_usd > self.baseline_usd:
+            raise ValueError("target_usd cannot exceed baseline_usd")
+        if not 0 <= self.tolerance < 1:
+            raise ValueError("Cost-target tolerance must be in [0, 1)")
+
+    @property
+    def target_upper_usd(self) -> float:
+        return self.target_usd * (1.0 + self.tolerance)
+
+    def to_dict(self) -> dict:
+        self.validate()
+        return {
+            "baseline_usd": self.baseline_usd,
+            "target_usd": self.target_usd,
+            "tolerance": self.tolerance,
+            "baseline_band_usd": [
+                self.baseline_usd * (1.0 - self.tolerance),
+                self.baseline_usd * (1.0 + self.tolerance),
+            ],
+            "target_band_usd": [
+                self.target_usd * (1.0 - self.tolerance),
+                self.target_upper_usd,
+            ],
+            "reference_savings_usd": self.baseline_usd - self.target_usd,
+            "reference_reduction_pct": (
+                100.0 * (self.baseline_usd - self.target_usd) / self.baseline_usd
+            ),
+        }
+
+
 def estimate_v42_cost(
     total_tokens: int,
     total_params: int,
@@ -416,6 +461,76 @@ def estimate_v42_cost(
         "first-order compute only; use measured FLOPs/token for shared layers, "
         "activation recompute, communication, data stalls, and checkpointing"
     )
+    return result
+
+
+def optimize_v42_cost(
+    total_tokens: int,
+    total_params: int,
+    active_params: int,
+    naive: V42ThroughputProfile,
+    optimized: V42ThroughputProfile,
+    distributed: V42DistributedConfig,
+    target: Optional[V42CostTarget] = None,
+) -> Dict[str, dict]:
+    """Plan the measured optimized throughput needed to meet a budget target.
+
+    The default reference target turns a roughly $300K naive project into an
+    approximately $120K optimized project (60% reduction, with a 5% tolerance).
+    All workload, model, hardware, and price inputs remain caller-defined.
+
+    This function does not relabel an estimate as an achieved saving. It keeps
+    the naive/optimized measured columns, reports whether the current optimized
+    profile meets the target, and derives the minimum optimized profile that
+    would hit the target at the same GPU price, efficiency, and FLOPs/token.
+    That required profile must still be validated by a real benchmark.
+    """
+    target = target or V42CostTarget()
+    target.validate()
+    result = estimate_v42_cost(
+        total_tokens=total_tokens,
+        total_params=total_params,
+        active_params=active_params,
+        naive=naive,
+        optimized=optimized,
+        distributed=distributed,
+    )
+    naive_cost = result["naive"]["cost_usd"]
+    optimized_cost = result["optimized"]["cost_usd"]
+    additional_speedup = max(1.0, optimized_cost / target.target_usd)
+    required_profile = V42ThroughputProfile(
+        gpu_price_per_hour=optimized.gpu_price_per_hour,
+        achieved_tflops_per_gpu=(
+            optimized.achieved_tflops_per_gpu * additional_speedup
+        ),
+        efficiency=optimized.efficiency,
+        flops_per_token=optimized.flops_per_token,
+    )
+    required_profile.validate()
+    baseline_band = target.to_dict()["baseline_band_usd"]
+    result["cost_target"] = {
+        **target.to_dict(),
+        "naive_within_reference_band": (
+            baseline_band[0] <= naive_cost <= baseline_band[1]
+        ),
+        "current_optimized_cost_usd": optimized_cost,
+        "current_savings_usd": naive_cost - optimized_cost,
+        "current_reduction_pct": 100.0 * (naive_cost - optimized_cost) / naive_cost,
+        "current_target_met": optimized_cost <= target.target_upper_usd,
+        "additional_speedup_x": additional_speedup,
+        "additional_savings_required_usd": max(
+            0.0, optimized_cost - target.target_usd
+        ),
+    }
+    result["required_optimized_profile"] = {
+        **asdict(required_profile),
+        "effective_tflops_per_gpu": (
+            required_profile.achieved_tflops_per_gpu * required_profile.efficiency
+        ),
+        "projected_cost_usd": optimized_cost / additional_speedup,
+        "evidence_required": "measure this profile end-to-end before claiming the target",
+    }
+    result["required_speedup_vs_naive_x"] = naive_cost / target.target_usd
     return result
 
 
