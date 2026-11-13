@@ -113,6 +113,36 @@ Contract tests are not evidence of real model quality, operator competence, thro
 
 The first-order calculation uses dense `6 × total_params` and `6 × active_params` FLOPs/token. Either throughput profile can override these with measured end-to-end FLOPs/token to include shared-layer compute, recomputation, communication, data stalls, and checkpointing.
 
+### Budget-target optimizer
+
+`optimize_v42_cost()` wraps the same estimator with a caller-configurable `V42CostTarget`. Its default reference case is **$300,000 naive → approximately $120,000 optimized**: $180,000 savings, a 60% reduction, with a 5% approximation tolerance. This budget target does not reintroduce model, stage, hardware, or data presets.
+
+The report retains both measured-assumption columns and adds:
+
+- `cost_target.current_target_met`: true only when the current optimized estimate is at or below the target's upper tolerance bound ($126,000 for the default target);
+- `cost_target.additional_speedup_x`: the additional optimized throughput factor needed to reach exactly $120,000, or 1.0 when the current plan is already cheaper;
+- `required_optimized_profile`: the minimum achieved TFLOPs/GPU needed at the caller's existing GPU price, efficiency, and FLOPs/token;
+- `required_speedup_vs_naive_x`: the naive-to-target cost ratio (2.5× for the $300K → $120K reference case).
+
+The required profile is a benchmark target, not fabricated evidence of a real saving. Apply it to `estimate_v42_cost()` to verify the arithmetic, then measure the actual training workload end-to-end before claiming the budget result. Plans already below $120K are never slowed down to hit the reference number.
+
+```python
+from rbuild import V42CostTarget, optimize_v42_cost
+
+report = optimize_v42_cost(
+    total_tokens=total_tokens,
+    total_params=total_params,
+    active_params=active_params,
+    naive=naive_profile,
+    optimized=optimized_profile,
+    distributed=plan,
+    target=V42CostTarget(),  # $300K → ~$120K; override for other projects
+)
+assert set(("naive", "optimized")).issubset(report)
+print(report["cost_target"])
+print(report["required_optimized_profile"])
+```
+
 ## Use
 
 ```python

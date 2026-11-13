@@ -12,6 +12,7 @@ from rbuild import (
     RBuildConfig,
     RBuildModel,
     Trainer,
+    V42CostTarget,
     V42DataSource,
     V42DistributedConfig,
     V42Ladder,
@@ -20,6 +21,7 @@ from rbuild import (
     V42StreamingData,
     V42ThroughputProfile,
     estimate_v42_cost,
+    optimize_v42_cost,
     v42_release_gate,
 )
 
@@ -145,6 +147,73 @@ class V42CallerConfigurationTests(unittest.TestCase):
         self.assertEqual(result["optimized"]["flops_per_token"], 1_200_000)
         self.assertGreater(result["naive"]["cost_usd"], result["optimized"]["cost_usd"])
         self.assertIn("speedup_x", result)
+
+    def test_default_target_derives_300k_to_120k_profile(self):
+        inputs = dict(
+            total_tokens=27_000_000_000_000_000_000_000,
+            total_params=1_000_000,
+            active_params=200_000,
+            naive=V42ThroughputProfile(2.0, 100.0, efficiency=0.5,
+                                       flops_per_token=1.0),
+            optimized=V42ThroughputProfile(2.0, 100.0, efficiency=1.0,
+                                           flops_per_token=1.0),
+            distributed=custom_distributed(),
+        )
+        result = optimize_v42_cost(**inputs)
+        self.assertAlmostEqual(result["naive"]["cost_usd"], 300_000.0)
+        self.assertAlmostEqual(result["optimized"]["cost_usd"], 150_000.0)
+        self.assertTrue(result["cost_target"]["naive_within_reference_band"])
+        self.assertFalse(result["cost_target"]["current_target_met"])
+        self.assertEqual(result["cost_target"]["reference_savings_usd"], 180_000.0)
+        self.assertEqual(result["cost_target"]["reference_reduction_pct"], 60.0)
+        self.assertAlmostEqual(result["cost_target"]["additional_speedup_x"], 1.25)
+        self.assertAlmostEqual(result["required_speedup_vs_naive_x"], 2.5)
+
+        required = result["required_optimized_profile"]
+        self.assertAlmostEqual(required["achieved_tflops_per_gpu"], 125.0)
+        self.assertAlmostEqual(required["projected_cost_usd"], 120_000.0)
+        resolved_inputs = dict(inputs)
+        resolved_inputs["optimized"] = V42ThroughputProfile(
+            required["gpu_price_per_hour"],
+            required["achieved_tflops_per_gpu"],
+            efficiency=required["efficiency"],
+            flops_per_token=required["flops_per_token"],
+        )
+        resolved = estimate_v42_cost(**resolved_inputs)
+        self.assertAlmostEqual(resolved["optimized"]["cost_usd"], 120_000.0)
+
+    def test_cost_target_never_downgrades_an_already_meeting_profile(self):
+        result = optimize_v42_cost(
+            total_tokens=27_000_000_000_000_000_000_000,
+            total_params=1_000_000,
+            active_params=200_000,
+            naive=V42ThroughputProfile(2.0, 100.0, 0.5, flops_per_token=1.0),
+            optimized=V42ThroughputProfile(2.0, 200.0, 1.0, flops_per_token=1.0),
+            distributed=custom_distributed(),
+        )
+        self.assertTrue(result["cost_target"]["current_target_met"])
+        self.assertEqual(result["cost_target"]["additional_speedup_x"], 1.0)
+        self.assertEqual(
+            result["required_optimized_profile"]["achieved_tflops_per_gpu"], 200.0
+        )
+        self.assertAlmostEqual(
+            result["required_optimized_profile"]["projected_cost_usd"], 75_000.0
+        )
+
+    def test_cost_target_is_configurable_and_rejects_invalid_budgets(self):
+        target = V42CostTarget(baseline_usd=200_000.0, target_usd=80_000.0,
+                               tolerance=0.1)
+        self.assertEqual(target.to_dict()["reference_reduction_pct"], 60.0)
+        invalid = (
+            V42CostTarget(baseline_usd=0.0),
+            V42CostTarget(target_usd=float("nan")),
+            V42CostTarget(tolerance=float("inf")),
+            V42CostTarget(baseline_usd=100_000.0, target_usd=120_000.0),
+            V42CostTarget(tolerance=1.0),
+        )
+        for bad_target in invalid:
+            with self.subTest(target=bad_target), self.assertRaises(ValueError):
+                bad_target.validate()
 
 
 class V42LadderTests(unittest.TestCase):

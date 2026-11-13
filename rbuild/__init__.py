@@ -68,8 +68,9 @@ from .v41 import (V41Config, RBuildAdaptedModel, RBuildBaseTrainer,
                   continued_pretraining_batches, supervised_fine_tuning_batches,
                   v41_release_gate)
 from .v42 import (V42MemoryLedger, V42Stage, V42Ladder,
-                  V42DistributedConfig, V42ThroughputProfile,
-                  estimate_v42_cost, V42DataSource, V42StreamingData,
+                  V42DistributedConfig, V42ThroughputProfile, V42CostTarget,
+                  estimate_v42_cost, optimize_v42_cost,
+                  V42DataSource, V42StreamingData,
                   V42StageTrainer, V42ScratchTrainer, v42_release_gate)
 from .optim import Muon, WSDScheduler, build_optimizer
 from .data import (load_manifest, manifest_batches, hf_image_batches,
@@ -103,7 +104,8 @@ __all__ = [
     "V41Config", "RBuildAdaptedModel", "RBuildBaseTrainer",
     "continued_pretraining_batches", "supervised_fine_tuning_batches", "v41_release_gate",
     "V42MemoryLedger", "V42Stage", "V42Ladder",
-    "V42DistributedConfig", "V42ThroughputProfile", "estimate_v42_cost",
+    "V42DistributedConfig", "V42ThroughputProfile", "V42CostTarget",
+    "estimate_v42_cost", "optimize_v42_cost",
     "V42DataSource", "V42StreamingData",
     "V42StageTrainer", "V42ScratchTrainer", "v42_release_gate",
     "Muon", "WSDScheduler", "build_optimizer", "Trainer", "interactive",
