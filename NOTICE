@@ -1,0 +1,23 @@
+R-Build engine (rbuild-engine), including R-Run
+Copyright (c) 2026 Han Muyang
+
+Licensed under the Velandris License 1.0
+(https://huggingface.co/Velandris/velandris-license/blob/main/LICENSE.md).
+The full license text is in LICENSE.
+
+Licensor: Han Muyang
+Attribution: "Built with R-Build by Han Muyang"
+Governing law: Hong Kong Special Administrative Region
+
+Original work of the Licensor: the R-Build architecture, training engine,
+conversion tools, R-Run serving engine, documentation and examples
+(https://github.com/hanmuyang1-collab/rbuild-engine).
+
+Earlier releases: versions up to and including 4.2.0 were published under the
+Apache License 2.0. Copies of those versions obtained under that license
+remain usable under its terms. Version 4.3.0 and later are licensed only under
+the Velandris License 1.0.
+
+Third-party components: none are bundled. Dependencies installed separately
+(for example PyTorch, Hugging Face Transformers and Datasets, FastAPI, vLLM)
+remain under their own licenses.

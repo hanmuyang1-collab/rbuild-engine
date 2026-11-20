@@ -88,9 +88,11 @@ class Block(nn.Module):
             dense_dim=cfg.parallel.dense_ffn_dim, ffn_mult=cfg.parallel.ffn_mult,
         )
 
-    def forward(self, x, kv_cache=None, start_pos=0, use_cache=False):
+    def forward(self, x, kv_cache=None, start_pos=0, use_cache=False,
+                positions=None, pos_limit=None):
         a, new_cache = self.attn(self.norm1(x), kv_cache=kv_cache,
-                                 start_pos=start_pos, use_cache=use_cache)
+                                 start_pos=start_pos, use_cache=use_cache,
+                                 positions=positions, pos_limit=pos_limit)
         x = x + a
         x = x + self.ffn(self.norm2(x))
         return x, new_cache
@@ -103,9 +105,10 @@ class _TokenSubsetBlock(nn.Module):
         super().__init__()
         self.block = block
 
-    def forward(self, x, **_):
-        # routed token subset: treat as independent length-1 sequences
-        out, _ = self.block(x, kv_cache=None, start_pos=0, use_cache=False)
+    def forward(self, x, positions=None, pos_limit=None, **_):
+        # v4.3: the routed subset is one causal sequence at its true positions
+        out, _ = self.block(x, kv_cache=None, start_pos=0, use_cache=False,
+                            positions=positions, pos_limit=pos_limit)
         return out
 
 
@@ -129,7 +132,7 @@ class CacheLoopLine(nn.Module):
             # each loop iteration gets its own copy of the line
             self.line = None
             self.loop_line = nn.ModuleList(
-                nn.ModuleList(Block(cfg, ffn_kind="dense") for _ in range(cl.n_loops))
+                nn.ModuleList(Block(cfg, ffn_kind="dense") for _ in range(cl.n_layers))
                 for _ in range(cl.n_loops)
             )
         self.mod = MoDRouter(cfg.model.d_model, cl.mod_capacity) if cl.use_mod_routing else None
@@ -152,13 +155,21 @@ class CacheLoopLine(nn.Module):
     def _run_blocks(self, x: torch.Tensor, loop: int,
                     stable_inference: bool = False) -> torch.Tensor:
         blocks = self.line if self.line is not None else self.loop_line[loop]
+        # v4.3: activation checkpointing now covers the extraction loop too.
+        # v4.2 only checkpointed the parallel stages, yet the loop keeps
+        # n_layers x n_loops block activations alive — usually the largest
+        # activation footprint in the model.
+        ckpt = (self.training and self.cfg.train.grad_checkpoint
+                and torch.is_grad_enabled())
         for blk in blocks:
             if self.mod is not None and not stable_inference:
-                x = self.mod(x, _TokenSubsetBlock(blk))
+                fn = (lambda t, b=blk: self.mod(t, _TokenSubsetBlock(b)))
             else:
                 # Sequence-global MoD top-k is not prefix-invariant. The
                 # generation quality floor therefore uses the dense causal path.
-                x, _ = blk(x)
+                fn = (lambda t, b=blk: b(t)[0])
+            x = torch.utils.checkpoint.checkpoint(fn, x, use_reentrant=False) \
+                if ckpt else fn(x)
         return x
 
     def forward(self, x: torch.Tensor, memory: Optional[FastWeightMemory],
@@ -456,7 +467,8 @@ class RBuildModel(nn.Module):
                 and (not self.training or self.cfg.noting.observe_in_training)):
             self._self_observe(x)
 
-        logits = self._logits_from_hidden(x)
+        need_logits = not self._use_fused_ce(targets)
+        logits = self._logits_from_hidden(x) if need_logits else None
 
         loss = None
         if targets is not None:
@@ -465,7 +477,12 @@ class RBuildModel(nn.Module):
             if self.outgen is not None:                           # nor outgen placeholder runs
                 for tid in self.outgen.placeholder_ids():
                     targets = targets.masked_fill(input_ids == tid, -100)
-            loss = self._chunked_ce(logits, targets)
+            if logits is None:
+                # v4.3: fused, chunked LM-head + CE. The (B, T, V) logits are
+                # never materialised; each chunk is recomputed in backward.
+                loss = self._fused_ce(x, targets)
+            else:
+                loss = self._chunked_ce(logits, targets)
             loss = loss + 0.01 * self._moe_aux_loss()
             if ponder is not None:                                # v3: ACT halting loss
                 loss = loss + self.cfg.critic.halt_loss_weight * ponder
@@ -509,6 +526,44 @@ class RBuildModel(nn.Module):
         self.set_nsct(on)
 
     # ------------------------------------------------------------------ #
+    def _use_fused_ce(self, targets) -> bool:
+        """Fused LM-head+CE applies in training when nothing needs full logits."""
+        if targets is None or not self.training:
+            return False
+        if not getattr(self.cfg.train, "fused_lm_ce", False):
+            return False
+        if (self.draft is not None and self.cfg.draft_verify.cotrain
+                and not self.cfg.draft_verify.frozen):
+            return False          # the drafter's KL needs the teacher logits
+        return True
+
+    def _ce_chunk(self, h: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        logits = self._logits_from_hidden(h)
+        return F.cross_entropy(logits.float(), t, reduction="sum", ignore_index=-100)
+
+    def _fused_ce(self, hidden: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Mean CE without ever holding (B*T, V) logits. Each chunk's logits are
+        built, reduced to a scalar, and discarded; backward recomputes them
+        chunk by chunk. Peak logit memory drops from B*T*V*4 bytes to
+        ce_chunk_tokens*V*4 bytes (e.g. 64K tokens x 248K vocab: 63 GB -> 4 GB).
+        """
+        D = hidden.shape[-1]
+        flat_h = hidden.reshape(-1, D)
+        flat_t = targets.reshape(-1)
+        chunk = max(1, self.cfg.train.ce_chunk_tokens)
+        count = (flat_t != -100).sum().clamp_min(1)
+        total = hidden.new_zeros((), dtype=torch.float32)
+        grad = torch.is_grad_enabled()
+        for i in range(0, flat_h.shape[0], chunk):
+            h, t = flat_h[i:i + chunk], flat_t[i:i + chunk]
+            if grad:
+                total = total + torch.utils.checkpoint.checkpoint(
+                    self._ce_chunk, h, t, use_reentrant=False)
+            else:
+                total = total + self._ce_chunk(h, t)
+        return total / count
+
     def _chunked_ce(self, logits, targets):
         """Chunked cross-entropy over the token axis (memory saver)."""
         B, T, V = logits.shape
@@ -518,13 +573,12 @@ class RBuildModel(nn.Module):
         chunk = max(1, self.cfg.train.ce_chunk_tokens)
         flat_l = logits.reshape(-1, V)
         flat_t = targets.reshape(-1)
-        total, count = 0.0, 0
+        total = logits.new_zeros((), dtype=torch.float32)
         for i in range(0, flat_l.shape[0], chunk):
-            ls = F.cross_entropy(flat_l[i:i + chunk].float(), flat_t[i:i + chunk],
-                                 reduction="sum", ignore_index=-100)
-            total = total + ls
-            count += int((flat_t[i:i + chunk] != -100).sum())   # skip ignored positions
-        return total / max(1, count)
+            total = total + F.cross_entropy(flat_l[i:i + chunk].float(), flat_t[i:i + chunk],
+                                            reduction="sum", ignore_index=-100)
+        # v4.3: one on-device count instead of a host sync per chunk
+        return total / (flat_t != -100).sum().clamp_min(1)
 
     def _moe_aux_loss(self):
         aux = torch.zeros((), device=next(self.parameters()).device)
@@ -681,6 +735,64 @@ class RBuildModel(nn.Module):
         nxt = self._sample_logits(prepared, generator=generator)
         return torch.cat([out, nxt], dim=1)
 
+    # ------------------------------------------------------------------ #
+    # v4.3: KV-cached incremental decoding on the stable inference path.
+    # v4.2 re-encoded the whole window (every loop x every block x every
+    # branch) for every new token: O(T) work per token, O(T^2) per reply.
+    # The stable path is fixed-depth, dense and causal, and the memory pull,
+    # bundling and norms are per-position, so per-block KV caches are valid.
+    # ------------------------------------------------------------------ #
+    @torch.no_grad()
+    def _encode_cached(self, ids: torch.Tensor, caches: dict, start_pos: int,
+                       images: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x, _ = self._splice_vision(ids, images)
+        x = self.drop(x)
+        cl = self.cache_loop
+        n = self._runtime_max_loops or cl.n_loops
+        for loop in range(n):
+            blocks = cl.line if cl.line is not None else cl.loop_line[loop % cl.n_loops]
+            for j, blk in enumerate(blocks):
+                key = ("loop", loop, j)
+                x, caches[key] = blk(x, kv_cache=caches.get(key),
+                                     start_pos=start_pos, use_cache=True)
+            if self.memory is not None and (loop + 1) % cl.read_every == 0:
+                x = cl._pull_cache(cl.read_norm(x), self.memory)
+        for si, stage in enumerate(self.stages):
+            outs = []
+            for bi, branch in enumerate(stage.branches):
+                key = ("stage", si, bi)
+                o, caches[key] = branch(x, kv_cache=caches.get(key),
+                                        start_pos=start_pos, use_cache=True)
+                outs.append(o)
+            x = x + stage.out_norm(stage._bundle(outs, x))
+        return self.final_norm(x)
+
+    @torch.no_grad()
+    def _generate_ar_cached(self, input_ids: torch.Tensor, max_new_tokens: int,
+                            sampling: dict, watermark: bool, eos_id: Optional[int],
+                            images: Optional[torch.Tensor], base_seed: int) -> torch.Tensor:
+        if input_ids.shape[1] + max_new_tokens > self.cfg.model.max_seq_len:
+            # Past the window the v4.2 contract slides it (positions restart),
+            # which a cache cannot reproduce; keep exact semantics there.
+            return self._generate_ar(input_ids, max_new_tokens, sampling,
+                                     watermark, eos_id, images, base_seed)
+        caches: dict = {}
+        hidden = self._encode_cached(input_ids, caches, 0, images)
+        out = input_ids
+        for index in range(max_new_tokens):
+            logits = self._logits_from_hidden(hidden[:, -1:])[:, -1, :]
+            prepared = self._prepare_target_logits(logits, out[:, -1], sampling, watermark)
+            generator = self._token_rng(out.device, base_seed, index)
+            nxt = self._sample_logits(prepared, generator=generator)
+            out = torch.cat([out, nxt], dim=1)
+            if eos_id is not None and (out[:, -1] == eos_id).all():
+                break
+            if index + 1 < max_new_tokens:
+                hidden = self._encode_cached(nxt, caches, out.shape[1] - 1)
+        self.last_kv_cache_bytes = sum(k.numel() * k.element_size() * 2
+                                       for k, _ in caches.values())
+        return out
+
     @torch.no_grad()
     def _generate_ar(self, input_ids: torch.Tensor, max_new_tokens: int,
                      sampling: dict, watermark: bool, eos_id: Optional[int],
@@ -708,7 +820,8 @@ class RBuildModel(nn.Module):
                  images: Optional[torch.Tensor] = None,
                  watermark: Optional[bool] = None,
                  effort: Optional[str] = None,
-                 use_v4: Optional[bool] = None) -> torch.Tensor:
+                 use_v4: Optional[bool] = None,
+                 kv_cache: Optional[bool] = None) -> torch.Tensor:
         # thinking modes set the sampling defaults; effort= picks a
         # selectable-effort tag ("low"/"medium"/"high"/...) for this call
         with self._temporary_effort(effort):
@@ -729,6 +842,14 @@ class RBuildModel(nn.Module):
             if accelerate:
                 return self.v4_decoder.generate(
                     input_ids, max_new_tokens, sampling, wm, eos_id, images, base_seed)
+            use_kv = self.cfg.model.kv_cache_generation if kv_cache is None else kv_cache
+            if use_kv:
+                # Same sampling streams as the exact path; values agree to
+                # floating-point tolerance, not bit-for-bit (different
+                # attention reduction order), so the v4 byte-exact contract
+                # is only claimed for kv_cache=False.
+                return self._generate_ar_cached(input_ids, max_new_tokens, sampling,
+                                                wm, eos_id, images, base_seed)
             return self._generate_ar(input_ids, max_new_tokens, sampling,
                                      wm, eos_id, images, base_seed)
 

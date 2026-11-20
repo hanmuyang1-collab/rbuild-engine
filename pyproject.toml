@@ -4,12 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rbuild-engine"
-version = "4.2.0"
-description = "R-Build v4.2: caller-defined from-scratch training beside non-destructive V4.1 conversion, CPT and SFT, with universal CUA, V4 draft-verify, V3 experts, memory, media, and R-Run."
+version = "4.3.0"
+description = "R-Build v4.3: GPU/memory-efficient engine with caller-defined from-scratch training beside non-destructive V4.1 conversion, CPT and SFT, with universal CUA, V4 draft-verify, V3 experts, memory, media, and R-Run."
 readme = "README.md"
 requires-python = ">=3.10"
-license = "Apache-2.0"
-authors = [{ name = "GeoThinkAI" }]
+license = "LicenseRef-Velandris-1.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Han Muyang" }]
 keywords = ["llm", "vlm", "moe", "muon", "fast-weight-memory", "act-halting", "critic-experts", "self-training", "agentic", "cua", "computer-use", "training", "architecture", "serving", "hot-swap"]
 dependencies = [
     "torch>=2.0",
@@ -27,7 +28,8 @@ dev = ["ipywidgets>=8.0", "transformers>=4.40", "datasets>=2.18",
 rrun = "rrun.cli:main"
 
 [project.urls]
-Homepage = "https://huggingface.co/GeoThinkAI"
+Homepage = "https://github.com/hanmuyang1-collab/rbuild-engine"
+License = "https://huggingface.co/Velandris/velandris-license/blob/main/LICENSE.md"
 
 [tool.setuptools.packages.find]
 include = ["rbuild*", "rrun*"]

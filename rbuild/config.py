@@ -59,6 +59,9 @@ class ModelConfig:
     rmsnorm_eps: float = 1e-6
     tie_embeddings: bool = True
     dropout: float = 0.0
+    # v4.3: KV-cached incremental AR decoding (opt-in; float-tolerance equal
+    # to the exact re-encode path, which stays the v4 byte-exact reference)
+    kv_cache_generation: bool = False
 
     def resolved_head_dim(self) -> int:
         return self.head_dim or (self.d_model // self.n_heads)
@@ -399,6 +402,12 @@ class TrainConfig:
     chunked_ce: bool = True          # chunked cross-entropy (memory saver)
     ce_chunk_tokens: int = 4096
     grad_checkpoint: bool = False
+    # v4.3 GPU / memory stack
+    fused_lm_ce: bool = True         # chunked LM-head+CE, never materialise (B,T,V) logits
+    compile: bool = False            # torch.compile the model in Trainer (CUDA)
+    optimizer_8bit: bool = False     # bitsandbytes 8-bit AdamW states if installed
+    muon_bf16: bool = True           # Newton-Schulz in bf16 on CUDA (fp32 on CPU)
+    peak_tflops_per_gpu: Optional[float] = None  # set to log MFU (e.g. 989 H100, 2250 B200 bf16 dense)
     # cost model (for report(); prices user-modifiable)
     gpu_price_per_hour: float = 2.0  # e.g. H100 SXM on a budget cloud
     gpus: int = 8
@@ -498,6 +507,10 @@ class RBuildConfig:
         if p.branch_ffn == "moe":
             assert 1 <= p.expert_top_k <= p.n_experts
         assert mem.key_dim >= 8 and mem.value_dim >= 8
+        # v4.3: the cache pull adds retrieved values to the residual stream,
+        # so a mismatch used to crash deep inside the first forward pass.
+        assert not mem.enabled or mem.value_dim == m.d_model, \
+            f"memory.value_dim ({mem.value_dim}) must equal model.d_model ({m.d_model})"
         assert self.train.precision in ("fp32", "bf16", "fp8")
         assert self.train.optimizer in ("muon", "adamw")
         # v3: critics

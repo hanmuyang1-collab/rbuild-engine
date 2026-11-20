@@ -24,7 +24,7 @@ from .cua import load_cua_compatible_state
 from .model import RBuildModel
 from .optim import Muon, WSDScheduler, build_optimizer
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 
 @contextmanager
@@ -76,6 +76,15 @@ class Trainer:
         self.model = model.to(self.device)
         if wrap_fn is not None:
             self.model = wrap_fn(self.model)
+        if self.device.startswith("cuda"):
+            # v4.3: TF32 for any fp32 matmul left outside autocast
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        self._fwd = self.model
+        if getattr(cfg.train, "compile", False) and hasattr(torch, "compile") \
+                and self.device.startswith("cuda"):
+            # dynamic=True: MoE expert slices and MoD subsets vary in size
+            self._fwd = torch.compile(self.model, dynamic=True)
         self.log = log_fn or (lambda *_: None)
         self.optimizers = build_optimizer(self.model, cfg)
         base_lrs = [[g["lr"] for g in opt.param_groups] for opt in self.optimizers]
@@ -101,7 +110,7 @@ class Trainer:
         cfg = self.cfg
         max_steps = max_steps or cfg.train.max_steps
         self.model.train()
-        step, accum, t0, history = 0, 0, time.time(), []
+        step, accum, t0, history, pending = 0, 0, time.time(), [], []
         data_iter = iter(batches)
         while step < max_steps:
             try:
@@ -122,14 +131,21 @@ class Trainer:
                 x, y = batch
                 images = None
                 out_targets = None
-            x, y = x.to(self.device), y.to(self.device)
+            nb = self.device_type == "cuda"
+            x, y = x.to(self.device, non_blocking=nb), y.to(self.device, non_blocking=nb)
 
             lr_f = self.sched.set(step)
-            with _autocast_ctx(cfg.train.precision, self.device_type):
-                _, loss = self.model(x, targets=y, images=images,
-                                     out_targets=out_targets)
-                loss = loss / cfg.train.grad_accum
-            loss.backward()
+            # v4.3: under DDP, skip the gradient all-reduce on every
+            # micro-batch except the last one of the accumulation window.
+            last_micro = (accum + 1) % cfg.train.grad_accum == 0
+            sync_ctx = self.model.no_sync() \
+                if (not last_micro and hasattr(self.model, "no_sync")) else nullcontext()
+            with sync_ctx:
+                with _autocast_ctx(cfg.train.precision, self.device_type):
+                    _, loss = self._fwd(x, targets=y, images=images,
+                                        out_targets=out_targets)
+                    loss = loss / cfg.train.grad_accum
+                loss.backward()
             accum += 1
 
             if accum % cfg.train.grad_accum == 0:
@@ -138,12 +154,21 @@ class Trainer:
                     opt.step()
                     opt.zero_grad(set_to_none=True)
                 step += 1
-                history.append(float(loss.detach()) * cfg.train.grad_accum)
+                # v4.3: keep the loss on device; read it back only when logging
+                pending.append(loss.detach() * cfg.train.grad_accum)
                 if step % 10 == 0 or step == 1:
+                    history.extend(float(v) for v in pending)
+                    pending.clear()
+                    dt = max(1e-9, time.time() - t0)
                     tok_s = (cfg.train.batch_size * cfg.train.grad_accum
-                             * cfg.model.max_seq_len * step) / max(1e-9, time.time() - t0)
+                             * cfg.model.max_seq_len * step) / dt
                     halt = getattr(_unwrap(self.model).cache_loop, "last_halting", None)
                     extra = f"  loops {halt['mean_loops']:.1f}" if halt else ""
+                    mfu = self._mfu(tok_s)
+                    if mfu is not None:
+                        extra += f"  MFU {mfu * 100:.1f}%"
+                    if self.device_type == "cuda":
+                        extra += f"  peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB"
                     self.log(f"step {step}/{max_steps}  loss {history[-1]:.4f}  "
                              f"lr_x{lr_f:.3f}  ~{tok_s:,.0f} tok/s{extra}")
                 if cfg.train.self_train_every > 0 and step % cfg.train.self_train_every == 0:
@@ -152,7 +177,19 @@ class Trainer:
                         self.log(f"  self-train consolidation loss {st_loss:.4f}")
                 if save_every > 0 and save_dir and step % save_every == 0:
                     self.save_checkpoint(save_dir)
+        history.extend(float(v) for v in pending)
         return {"loss": history}
+
+    # ------------------------------------------------------------------ #
+    def _mfu(self, tok_s_per_process: float) -> Optional[float]:
+        """Model FLOPs utilisation = 6 * active params * tok/s / peak."""
+        peak = getattr(self.cfg.train, "peak_tflops_per_gpu", None)
+        if not peak:
+            return None
+        if not hasattr(self, "_active_params"):
+            counts = self.cfg.count_parameters()
+            self._active_params = counts.get("active_params_per_token") or counts.get("total_params")
+        return 6.0 * self._active_params * tok_s_per_process / (peak * 1e12)
 
     # ------------------------------------------------------------------ #
     # v3: consolidate critic-verified notes into the slow weights

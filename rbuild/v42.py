@@ -18,6 +18,7 @@ import queue
 import random
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
@@ -694,7 +695,7 @@ class V42StageTrainer(Trainer):
         cfg = self.cfg
         max_steps = max_steps or cfg.train.max_steps
         self.model.train()
-        accumulation, started, history = 0, time.time(), []
+        accumulation, started, history, pending = 0, time.time(), [], []
         initial_step = self.step
         data_iter = iter(batches)
         while self.step < max_steps:
@@ -716,13 +717,20 @@ class V42StageTrainer(Trainer):
             else:
                 x, y = batch
                 images, out_targets = None, None
-            x, y = x.to(self.device), y.to(self.device)
+            nb = self.device_type == "cuda"
+            x, y = x.to(self.device, non_blocking=nb), y.to(self.device, non_blocking=nb)
             lr_factor = self.sched.set(self.step)
-            with _autocast_ctx(cfg.train.precision, self.device_type):
-                _, loss = self.model(x, targets=y, images=images,
-                                     out_targets=out_targets)
-                scaled_loss = loss / cfg.train.grad_accum
-            scaled_loss.backward()
+            # v4.3: DDP all-reduce only on the last micro-batch of the window
+            last_micro = (accumulation + 1) % cfg.train.grad_accum == 0
+            sync_ctx = self.model.no_sync() \
+                if (not last_micro and hasattr(self.model, "no_sync")) else nullcontext()
+            forward = getattr(self, "_fwd", self.model)
+            with sync_ctx:
+                with _autocast_ctx(cfg.train.precision, self.device_type):
+                    _, loss = forward(x, targets=y, images=images,
+                                      out_targets=out_targets)
+                    scaled_loss = loss / cfg.train.grad_accum
+                scaled_loss.backward()
             accumulation += 1
             if accumulation % cfg.train.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.train.grad_clip)
@@ -730,19 +738,28 @@ class V42StageTrainer(Trainer):
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
                 self.step += 1
-                history.append(float(loss.detach()) * cfg.train.grad_accum)
+                pending.append(loss.detach())       # v4.3: no per-step host sync
                 if self.step == 1 or self.step % 10 == 0:
+                    history.extend(float(v) for v in pending)
+                    pending.clear()
                     tokens = (cfg.train.batch_size * cfg.train.grad_accum
                               * cfg.model.max_seq_len * (self.step - initial_step))
                     tokens_per_second = tokens / max(1e-9, time.time() - started)
+                    extra = ""
+                    mfu = self._mfu(tokens_per_second) if hasattr(self, "_mfu") else None
+                    if mfu is not None:
+                        extra += f" MFU {mfu * 100:.1f}%"
+                    if self.device_type == "cuda":
+                        extra += f" peak {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB"
                     self.log(
                         f"step {self.step}/{max_steps} loss {history[-1]:.4f} "
-                        f"lr_x{lr_factor:.3f} ~{tokens_per_second:,.0f} tok/s"
+                        f"lr_x{lr_factor:.3f} ~{tokens_per_second:,.0f} tok/s{extra}"
                     )
                 if cfg.train.self_train_every > 0 and self.step % cfg.train.self_train_every == 0:
                     self.self_train_step()
                 if save_every > 0 and save_dir and self.step % save_every == 0:
                     self.save_checkpoint(save_dir)
+        history.extend(float(v) for v in pending)
         return {"loss": history, "steps": self.step}
 
     def save_checkpoint(self, path: str) -> None:
