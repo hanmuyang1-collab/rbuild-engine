@@ -1,4 +1,4 @@
-# R-Build v4.2
+# R-Build v4.3
 
 **A fully user-modifiable, open-source architecture + training-speed engine — with a caller-defined from-scratch ladder running beside non-destructive pretrained conversion, continued pretraining, and supervised fine-tuning, while retaining exact-AR draft–verify decoding, self-governing, and self-serving.**
 Every knob is yours: programmatically, through an interactive widget panel in
@@ -6,6 +6,16 @@ Colab/Jupyter, or a console prompt anywhere else.
 
 v3.1 merges **R-Run** into this repo — R-Build builds and trains the models,
 R-Run serves them. One repo, one engine: `rrun serve` / `rrun swap`.
+
+## What's new in v4.3
+
+v4.3 is a GPU/RAM efficiency and correctness release. On an A100 it trains
+**1.8-1.95x faster** with **18-55% less peak memory** than v4.2 on the same
+model, and decodes 2.5x faster with the opt-in KV cache. It fixes MoD blocks
+that had no attention, a wrong layer count in unshared cache loops, and full
+logits being materialised by the "chunked" loss. See **R-Build-V4.3-DESIGN.md**
+and `benchmarks/gpu_bench.py`. From 4.3.0 R-Build is licensed under the
+Velandris License 1.0.
 
 ## What's new in v4.2
 
@@ -189,7 +199,8 @@ PYTHONPATH=. python3 tests/cua_expansion_test.py
 PYTHONPATH=. python3 tests/smoke_test.py
 ```
 
-See **R-Build-V4.1-DESIGN.md** for the conversion and training contract.
+See **R-Build-V4.3-DESIGN.md** for the efficiency release,
+**R-Build-V4.1-DESIGN.md** for the conversion and training contract.
 
 ## What's new in v4
 
@@ -568,7 +579,8 @@ treat them as starting points and retune in the panel.
   bf16/fp8 flags, gradient checkpointing, periodic checkpoints, resume,
   FSDP/DDP via torchrun, optional push to the GeoThinkAI org.
 
-See **R-Build-V4.1-DESIGN.md** for conversion/training and
+See **R-Build-V4.3-DESIGN.md** for the efficiency release,
+**R-Build-V4.1-DESIGN.md** for conversion/training and
 **R-Build-V3-DESIGN.md** for the native architecture blueprint.
 
 ## License
