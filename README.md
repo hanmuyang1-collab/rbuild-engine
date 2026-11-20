@@ -571,4 +571,8 @@ treat them as starting points and retune in the panel.
 See **R-Build-V4.1-DESIGN.md** for conversion/training and
 **R-Build-V3-DESIGN.md** for the native architecture blueprint.
 
-Apache-2.0. Part of the GeoThinkAI R-Build project.
+## License
+
+Velandris License 1.0 (see `LICENSE` and `NOTICE`). Copyright (c) 2026 Han Muyang.
+Versions up to and including 4.2.0 were released under Apache-2.0 and remain
+usable under those terms; 4.3.0 and later are Velandris License only.

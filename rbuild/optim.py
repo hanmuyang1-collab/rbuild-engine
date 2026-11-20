@@ -14,11 +14,14 @@ from torch import nn
 
 
 @torch.no_grad()
-def _zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
-    """Newton-Schulz iteration to compute the orthogonalization of G."""
+def _zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5,
+                                 bf16: bool = False) -> torch.Tensor:
+    """Newton-Schulz iteration to compute the orthogonalization of G.
+    v4.3: bf16=True runs the iteration in bf16 (tensor-core speed, the
+    reference Muon setting); fp32 stays the default off-GPU."""
     assert G.ndim == 2
     a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.float()
+    X = G.bfloat16() if bf16 else G.float()
     X = X / (X.norm() + 1e-7)
     transposed = G.shape[0] > G.shape[1]
     if transposed:
@@ -36,8 +39,9 @@ class Muon(torch.optim.Optimizer):
     """Muon for 2-D hidden weights. All values user-tunable."""
 
     def __init__(self, params: Iterable, lr: float = 3e-3, momentum: float = 0.95,
-                 ns_steps: int = 5, weight_decay: float = 0.0):
-        defaults = dict(lr=lr, momentum=momentum, ns_steps=ns_steps, weight_decay=weight_decay)
+                 ns_steps: int = 5, weight_decay: float = 0.0, bf16: bool = True):
+        defaults = dict(lr=lr, momentum=momentum, ns_steps=ns_steps,
+                        weight_decay=weight_decay, bf16=bf16)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -55,10 +59,22 @@ class Muon(torch.optim.Optimizer):
                 buf = state["momentum_buffer"]
                 buf.mul_(mom).add_(g)
                 g = g.add(buf, alpha=mom)          # nesterov
+                # v4.3: Muon needs the WHOLE matrix. Under FSDP2 the grad is a
+                # sharded DTensor; orthogonalising a shard is mathematically
+                # wrong, so gather, orthogonalise, and re-shard the update.
+                dt_mesh = getattr(g, "device_mesh", None)
+                placements = getattr(g, "placements", None)
+                if dt_mesh is not None and hasattr(g, "full_tensor"):
+                    g = g.full_tensor()
                 g2 = g.reshape(g.shape[0], -1) if g.ndim > 2 else g
-                og = _zeropower_via_newtonschulz5(g2, steps=group["ns_steps"])
-                og = og.reshape_as(g)
+                og = _zeropower_via_newtonschulz5(
+                    g2, steps=group["ns_steps"],
+                    bf16=bool(group.get("bf16", True)) and g2.is_cuda)
+                og = og.reshape_as(g).to(p.dtype)
                 scale = max(1.0, g.shape[0] / g.reshape(g.shape[0], -1).shape[1]) ** 0.5
+                if dt_mesh is not None:
+                    from torch.distributed.tensor import distribute_tensor
+                    og = distribute_tensor(og, dt_mesh, placements)
                 if group["weight_decay"] > 0:
                     p.mul_(1 - lr * group["weight_decay"])
                 p.add_(og, alpha=-lr * scale)
@@ -82,18 +98,34 @@ def build_optimizer(model: nn.Module, cfg) -> List[torch.optim.Optimizer]:
         else:
             adamw_params.append(p)
     opts = []
-    if muon_params and cfg.train.optimizer == "muon":
-        opts.append(Muon(muon_params, lr=cfg.train.lr,
-                         momentum=cfg.train.muon_momentum,
-                         ns_steps=cfg.train.muon_ns_steps,
-                         weight_decay=cfg.train.weight_decay))
+    tc = cfg.train
+    on_cuda = any(p.is_cuda for p in muon_params + adamw_params)
+
+    def adamw(params, lr, **kw):
+        # v4.3: 8-bit states (bitsandbytes) cut Adam from 8 to 2 bytes/param;
+        # otherwise the fused CUDA kernel (one launch for all params).
+        if getattr(tc, "optimizer_8bit", False):
+            try:
+                import bitsandbytes as bnb
+                return bnb.optim.AdamW8bit(params, lr=lr, weight_decay=tc.weight_decay, **kw)
+            except ImportError:
+                pass
+        extra = {"fused": True} if on_cuda else {"foreach": True}
+        try:
+            return torch.optim.AdamW(params, lr=lr, weight_decay=tc.weight_decay, **kw, **extra)
+        except (RuntimeError, TypeError):
+            return torch.optim.AdamW(params, lr=lr, weight_decay=tc.weight_decay, **kw)
+
+    if muon_params and tc.optimizer == "muon":
+        opts.append(Muon(muon_params, lr=tc.lr,
+                         momentum=tc.muon_momentum,
+                         ns_steps=tc.muon_ns_steps,
+                         weight_decay=tc.weight_decay,
+                         bf16=getattr(tc, "muon_bf16", True)))
     elif muon_params:
-        opts.append(torch.optim.AdamW(muon_params, lr=cfg.train.adamw_lr,
-                                      weight_decay=cfg.train.weight_decay))
+        opts.append(adamw(muon_params, tc.adamw_lr))
     if adamw_params:
-        opts.append(torch.optim.AdamW(adamw_params, lr=cfg.train.adamw_lr,
-                                      weight_decay=cfg.train.weight_decay,
-                                      betas=(0.9, 0.95)))
+        opts.append(adamw(adamw_params, tc.adamw_lr, betas=(0.9, 0.95)))
     if not opts:
         raise ValueError("No trainable parameters were supplied to the optimizer")
     return opts

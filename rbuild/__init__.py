@@ -79,7 +79,7 @@ from .data import (load_manifest, manifest_batches, hf_image_batches,
 from .train import Trainer
 from . import interactive
 
-__version__ = "4.2.0"
+__version__ = "4.3.0"
 
 __all__ = [
     "RBuildConfig", "ModelConfig", "CacheLoopConfig", "ParallelConfig",
